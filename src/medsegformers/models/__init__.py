@@ -1,16 +1,20 @@
 _REGISTRY = {}
 
-def register(name: str):
-    """Decorator to register a model class under a string name."""
-    def deco(cls):
-        _REGISTRY[name] = cls
-        return cls
-    return deco
+def register(cls):
+    """Decorator with no nested function: class must have MODEL_NAME attr."""
+    name = getattr(cls, "MODEL_NAME", cls.__name__).lower()
+    if name in _REGISTRY and _REGISTRY[name] is not cls:
+        raise ValueError(f"Model '{name}' already registered")
+    _REGISTRY[name] = cls
+    return cls
 
 def build(name: str, **kwargs):
-    if name not in _REGISTRY:
-        raise ValueError(f"Unknown model '{name}'. Available: {list(_REGISTRY)}")
-    return _REGISTRY[name](**kwargs)
+    key = name.lower()
+    if key not in _REGISTRY:
+        avail = ", ".join(sorted(_REGISTRY.keys())) or "<none>"
+        raise KeyError(f"Unknown model '{name}'. Available: {avail}")
+    return _REGISTRY[key](**kwargs)
+
 
 __all__ = ["register", "build"]
 

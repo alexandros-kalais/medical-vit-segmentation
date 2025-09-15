@@ -2,11 +2,15 @@ import torch.nn as nn
 from monai.networks.nets import UNet
 from . import register
 
-@register("unet")
+@register 
 class UNetSmall(nn.Module):
     """
     Minimal MONAI U-Net wrapper.
     """
+
+    MODEL_NAME = "unet"
+
+
     def __init__(
         self,
         in_channels: int = 3,

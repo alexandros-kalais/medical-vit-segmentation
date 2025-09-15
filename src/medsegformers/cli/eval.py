@@ -1,0 +1,42 @@
+__all__ = ["main"]
+
+import torch
+from monai.data import DataLoader, list_data_collate
+
+from medsegformers.config.args import get_eval_args_parser
+from medsegformers.data import get_dataset_class
+from medsegformers.transforms import get_transforms
+from medsegformers.models import build as build_model
+from medsegformers.utils.paths import get_data_root
+from medsegformers.engines.evaluator import Evaluator
+
+def main():
+    args = get_eval_args_parser().parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # dataset via registry + class API
+    DatasetCls = get_dataset_class(args.dataset)
+    root = DatasetCls.default_root(get_data_root())
+    tf = get_transforms(dataset=args.dataset, kind=args.tf_kind, image_size=args.image_size)
+    test_ds = DatasetCls.build_split("test", transform=tf, root=root, seed=args.seed)
+
+    num_classes = getattr(DatasetCls, "NUM_CLASSES", None)
+    if not isinstance(num_classes, int):
+        raise AttributeError(f"{DatasetCls.__name__} must define NUM_CLASSES (int).")
+
+    loader = DataLoader(
+        test_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, collate_fn=list_data_collate,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    model = build_model(args.model, in_channels=3, out_channels=num_classes).to(device)
+
+    evaluator = Evaluator(model=model, num_classes=num_classes, device=device)
+    evaluator.load_checkpoint(args.checkpoint)
+
+    evaluator.run(loader, dataset=args.dataset)  # prints per-class + overall
+
+if __name__ == "__main__":
+    main()

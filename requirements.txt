@@ -5,3 +5,4 @@ timm>=0.9.0
 monai>=1.3.0
 wandb>=0.15.0
 tqdm>=4.65.0
+scikit-learn

@@ -4,11 +4,13 @@ from . import register
 from .encoders.vit_encoder import ViTEncoder
 from .decoders.linear_head import LinearHead
 
-@register("vit_linear")
+@register
 class ViT_Linear(nn.Module):
     """
     Plain ViT encoder + linear segmentation head (EoMT-style).
     """
+    MODEL_NAME = "vit_linear"
+
     def __init__(
         self,
         # required by your trainer's build() call

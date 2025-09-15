@@ -6,7 +6,7 @@ $imageH  = 224
 $imageW  = 224
 $ckpt    = ".\experiments\endoscopy\vit_linear-\checkpoints\final_model-epoch=0049-val_loss=1.0741.pth"
 
-python -m medsegformers.evaluate `
+python -m medsegformers.cli.eval `
   --dataset $dataset `
   --model $model `
   --image-size $imageH $imageW `
