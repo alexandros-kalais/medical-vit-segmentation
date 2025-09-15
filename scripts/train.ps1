@@ -2,19 +2,17 @@ $env:PYTHONPATH = "src"
 
 # --- config ---
 $dataset = "endoscopy"
-$model   = "vit_linear"
 $imageH  = 224
 $imageW  = 224
 $batch   = 4
 $epochs  = 50
-$expId   = "vit_linear-"
+$expId   = "vit_dinov2_linear"
 $subset = 8
-$lr = 1e-5
+$lr = 1e-4
 # -------------
 
 python -m medsegformers.cli.train `
   --dataset $dataset `
-  --model $model `
   --image-size $imageH $imageW `
   --batch-size $batch `
   --epochs $epochs `

@@ -5,7 +5,7 @@ import wandb
 from medsegformers.config.args import get_train_args_parser
 from medsegformers.data import get_dataset_class
 from medsegformers.transforms import get_transforms
-from medsegformers.models import build as build_model
+from medsegformers.models import build_segmentation_model
 from medsegformers.engines.trainer import Trainer
 from medsegformers.utils.paths import get_data_root
 
@@ -42,14 +42,13 @@ def main():
                               num_workers=args.num_workers, collate_fn=list_data_collate,
                               pin_memory=torch.cuda.is_available())
 
-    model = build_model(
-        args.model,
-        in_channels=3,
-        out_channels=num_classes,
-        vit_name="vit_base_patch16_224",
+    model = build_segmentation_model(
+        decoder=args.decoder,
+        num_classes=num_classes,
+        vit_name=args.vit_name,
         pretrained=True,
-        freeze_encoder=True,
-        img_size=tuple(args.image_size) if args.image_size else (224, 224),
+        freeze_encoder=args.freeze_encoder,
+        image_size = args.image_size[0]
     ).to(device)
 
     wandb.login()
