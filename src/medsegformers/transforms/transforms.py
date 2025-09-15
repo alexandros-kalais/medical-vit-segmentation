@@ -1,37 +1,60 @@
+# transforms.py
 from monai.transforms import (
-    Compose,
-    LoadImaged, EnsureChannelFirstd, ScaleIntensityd, AsDiscreted,
+    Compose, LoadImaged, EnsureChannelFirstd, ScaleIntensityd,
     RandFlipd, RandRotate90d, RandAffined, Resized, Lambdad, EnsureTyped
 )
 import numpy as np
+import torch
 
 # ----- dataset-specific mask preprocessors -----
 def binary_mask_preprocess(x: np.ndarray):
-    # x is (H,W) or (C,H,W); ensure single channel and binarize
+    """
+    Input x can be (H,W) or (C,H,W). Ensure single channel and binarize.
+    Returns float32 {0,1} as [1,H,W].
+    """
     if x.ndim == 2:
         x = x[None, ...]
-    if x.shape[0] > 1:  # RGB mask -> take first channel
+    if x.shape[0] > 1:  # e.g. RGB mask -> take first channel
         x = x[:1, ...]
     return (x > 0).astype(np.float32)
 
-def rgb_mask_to_class_indices(x):
-    # example for multi-class: map RGB -> integer class indices
-    COLOR_MAP = {
-        0: (  0,   0,   0), # background
-        1: (255,   0,   0), # cystic plate
-        2: (  0, 255,   0), # Calot triangle
-        3: (  0,   0, 255), # cystic artery
-        4: (255, 255,   0), # cystic duct
-        5: (255,   0, 255), # gallbladder
-        6: (  0, 255, 255), # tools
-    }
-    x = x.permute(1, 2, 0).astype(np.uint8)  # (C,H,W) -> (H,W,3)
-    h, w, _ = x.shape
-    y = np.zeros((h, w), dtype=np.int64)
-    for idx, color in COLOR_MAP.items():
-        matches = np.all(x == np.array(color, dtype=np.uint8), axis=-1)
-        y[matches] = idx
-    return y[None, ...]
+# palette used for visualization AND RGB masks
+PALETTE = np.array([
+    [  0,   0,   0],  # 0 background
+    [255,   0,   0],  # 1 cystic plate
+    [  0, 255,   0],  # 2 Calot triangle
+    [  0,   0, 255],  # 3 cystic artery
+    [255, 255,   0],  # 4 cystic duct
+    [255,   0, 255],  # 5 gallbladder
+    [  0, 255, 255],  # 6 tools
+], dtype=np.uint8)
+
+def mask_to_indices_endoscopy(x: np.ndarray) -> np.ndarray:
+    """
+    Robustly convert an Endoscopy mask to index map [1,H,W] int64 in [0..6].
+    Handles both single-channel indexed masks and 3-channel RGB masks.
+    """
+    # ensure channel-first
+    if x.ndim == 2:
+        x = x[None, ...]
+    c, h, w = x.shape
+
+    # Case A: already indexed (single channel)
+    if c == 1:
+        y = x.astype(np.int64)
+        # If values are e.g. 0..6 we're good; otherwise just return as-is
+        return y  # [1,H,W], int64
+
+    # Case B: true RGB mask
+    if c == 3:
+        rgb = np.moveaxis(x, 0, -1).astype(np.uint8)  # (H,W,3)
+        y = np.zeros((h, w), dtype=np.int64)
+        for idx, color in enumerate(PALETTE):
+            matches = np.all(rgb == color, axis=-1)
+            y[matches] = idx
+        return y[None, :]
+
+    raise ValueError(f"Unexpected mask shape {x.shape} in mask_to_indices_endoscopy")
 
 def get_transforms(dataset: str, kind="basic", image_size=None):
     """
@@ -39,9 +62,8 @@ def get_transforms(dataset: str, kind="basic", image_size=None):
     kind: "none" | "basic" | "aug"
     """
     keys_imglab = ["image", "label"]
-
     tfs = [
-        LoadImaged(keys=keys_imglab, image_only=True),  # loads both
+        LoadImaged(keys=keys_imglab, image_only=True),
         EnsureChannelFirstd(keys=keys_imglab),
     ]
 
@@ -49,36 +71,34 @@ def get_transforms(dataset: str, kind="basic", image_size=None):
     if dataset == "hyperkvasir":  # binary masks
         tfs += [
             Lambdad(keys="label", func=binary_mask_preprocess),
-            AsDiscreted(keys="label", threshold=0.5),
         ]
     elif dataset == "endoscopy":  # multi-class masks
         tfs += [
-            Lambdad(keys="label", func=rgb_mask_to_class_indices),
+            Lambdad(keys="label", func=mask_to_indices_endoscopy),
         ]
     else:
         raise ValueError(f"Unknown dataset {dataset}")
 
     # shared extras
     if kind in ("basic", "aug"):
-        tfs += [
-            ScaleIntensityd(keys="image"),
-        ]
+        tfs += [ScaleIntensityd(keys="image")]
 
     if image_size:
-        # You can give per-key modes via dict:
         tfs += [
-            Resized(keys=keys_imglab, spatial_size=image_size,
-                    mode=("bilinear", "nearest")),
+            Resized(
+                keys=keys_imglab,
+                spatial_size=image_size,
+                mode=("bilinear", "nearest"),  # image bilinear, label nearest
+            ),
         ]
 
     if kind == "aug":
-        # One random decision shared across both keys for each transform:
         tfs += [
-            RandFlipd(keys=keys_imglab, prob=0.9, spatial_axis=1),
-            RandRotate90d(keys=keys_imglab, prob=0.9, max_k=3),
+            RandFlipd(keys=keys_imglab, prob=0.5, spatial_axis=1),
+            RandRotate90d(keys=keys_imglab, prob=0.5, max_k=3),
             RandAffined(
                 keys=keys_imglab,
-                prob=0.9,
+                prob=0.5,
                 rotate_range=(0, 0, 0.1),
                 scale_range=(0.1, 0.1, 0.0),
                 mode=("bilinear", "nearest"),
@@ -86,6 +106,6 @@ def get_transforms(dataset: str, kind="basic", image_size=None):
             ),
         ]
 
-    # tfs += [EnsureTyped(keys=keys_imglab)]
+    # ALWAYS LAST: ensure final dtypes (float image, long label)
+    tfs += [EnsureTyped(keys=("image", "label"), dtype=(torch.float32, torch.long))]
     return Compose(tfs)
-

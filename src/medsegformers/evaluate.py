@@ -113,11 +113,11 @@ def evaluate(args):
 
     # --- Metrics
     # Include background=False to exclude class 0 from the averages
-    dice_metric = DiceMetric(include_background=False, reduction="none")  # per-class results
-    miou_metric = MeanIoU(include_background=False, reduction="none")
+    dice_metric = DiceMetric(include_background=True, reduction="none")  # per-class results
+    miou_metric = MeanIoU(include_background=True, reduction="none")
 
     hd95_metric = HausdorffDistanceMetric(
-        include_background=False,
+        include_background=True,
         percentile=95.0,
         directed=False,
         reduction="none",
@@ -165,7 +165,7 @@ def evaluate(args):
         class_names = ["foreground"]
     else:
         # exclude background for printing to match include_background=False
-        class_names = ENDOSCOPY_CLASS_NAMES[1:]  # drop background
+        class_names = ENDOSCOPY_CLASS_NAMES  # drop background
 
 
     # Convert to numpy and reduce over the image dimension (axis=0)
@@ -185,6 +185,14 @@ def evaluate(args):
         j = miou_cls[c].item() if c < miou_cls.size else float("nan")
         h = hd95_cls[c].item() if hd95_cls.size and c < hd95_cls.size else float("nan")
         print(f"{c:>2} {cname:>18} | Dice: {d:0.4f} | mIoU: {j:0.4f} | HD95 (px): {h:0.3f}")
+
+    # ---- Print overall averages (ignoring NaNs)
+    mean_dice = np.nanmean(dice_cls).item() if dice_cls.size else float("nan")
+    mean_miou = np.nanmean(miou_cls).item() if miou_cls.size else float("nan")
+    mean_hd95 = np.nanmean(hd95_cls).item() if hd95_cls.size else float("nan")
+
+    print(f"{'Overall Average':>20} | Dice: {mean_dice:0.4f} | mIoU: {mean_miou:0.4f} | HD95 (px): {mean_hd95:0.3f}")
+
 
 
 if __name__ == "__main__":

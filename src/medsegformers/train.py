@@ -1,48 +1,23 @@
-
+# train.py
 from pathlib import Path
-import torch
+import os
 import numpy as np
-from monai.data import ArrayDataset, DataLoader, decollate_batch, list_data_collate
-from monai.metrics import DiceMetric
-import monai
-from monai.transforms import Compose, Activations, AsDiscrete
+import torch
+from argparse import ArgumentParser
+from tqdm import tqdm
+
 import wandb
 from torchvision.utils import make_grid
-import os
-from argparse import ArgumentParser
+from monai.data import DataLoader, decollate_batch, list_data_collate
+from monai.metrics import DiceMetric
+from monai.transforms import Compose, Activations, AsDiscrete
+from monai.losses import DiceCELoss
 
-from tqdm import tqdm
 from medsegformers.data import HyperKvasirDataset, EndoscopyDataset
 from medsegformers.transforms import get_transforms
-from medsegformers.losses import FlexDiceLoss as DiceLoss
 from medsegformers.models import build as build_model
 
-def get_data_root() -> Path:
-    """
-    Returns the absolute path to the project's data folder.
-    """
-    # train.py → src/medsegformers/
-    # parents[2] → medSegformers/
-    project_root = Path(__file__).resolve().parents[2]
-    return project_root / "data"
-
-def project_root() -> Path:
-    # src/medsegformers/train.py → repo root is two levels up
-    return Path(__file__).resolve().parents[2]
-
-def ckpt_dir(args) -> Path:
-    return project_root() / "experiments" / args.dataset / args.experiment_id / "checkpoints"
-
-def make_ckpt(epoch, model, optimizer, extra=None):
-    return {
-        "epoch": epoch,
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "extra": extra or {},  # e.g., {"val_dice": 0.82}
-    }
-
-
-
+# ---------- color map for visualization ----------
 COLOR_MAP = torch.tensor([
     [  0,   0,   0],  # 0 background
     [255,   0,   0],  # 1 cystic plate
@@ -51,241 +26,213 @@ COLOR_MAP = torch.tensor([
     [255, 255,   0],  # 4 cystic duct
     [255,   0, 255],  # 5 gallbladder
     [  0, 255, 255],  # 6 tools
-], dtype=torch.uint8)  # (7,3)
+], dtype=torch.uint8)
 
 def colorize_index_map(idx_map: torch.Tensor) -> torch.Tensor:
     """
-    idx_map: (B,H,W) long in [0..6]
-    returns: (B,3,H,W) uint8 colored tensor
+    idx_map: (B,H,W) long or (H,W)
+    returns: (B,3,H,W) uint8
     """
-    # COLOR_MAP[idx] -> (B,H,W,3), then permute to (B,3,H,W)
-    colored = COLOR_MAP.to(idx_map.device)[idx_map]                  # (B,H,W,3)
-    return colored.permute(0, 3, 1, 2).contiguous()                # (B,3,H,W)
+    if idx_map.ndim == 2:
+        idx_map = idx_map.unsqueeze(0)
+    idx_map = idx_map.long()
+    cmap = COLOR_MAP.to(idx_map.device)
+    colored = cmap[idx_map]           # (B,H,W,3)
+    return colored.permute(0,3,1,2).contiguous()
 
+def to_np_uint8(grid):
+    x = grid.permute(1,2,0).cpu().numpy()
+    return np.clip(x, 0, 255).astype(np.uint8)
 
+# ---------- paths ----------
+def project_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+def get_data_root() -> Path:
+    return project_root() / "data"
+
+def ckpt_dir(args) -> Path:
+    return project_root() / "experiments" / args.dataset / args.experiment_id / "checkpoints"
+
+# ---------- args ----------
 def get_args_parser():
-    parser = ArgumentParser("Training for medical ViT segmentation model")
-    parser.add_argument("--dataset", type=str, choices = ["hyperkvasir", "endoscopy"], required=True, help="Dataset to use for training")
-    parser.add_argument("--model", type=str, default="unet", help="Model name registered in medsegformers.models (e.g., 'unet')")
-    parser.add_argument("--image-size", type=int, nargs=2, default=None, help="Size of images (height width)")
-    parser.add_argument("--train-tf-kind", type=str, default="basic", choices=["basic", "aug"], help= "Transformation types for training images")
-    parser.add_argument("--val-tf-kind", type=str, default="basic", choices=["basic", "aug"], help= "Transformation types for validation images")
-    parser.add_argument("--batch-size", type=int, default=4, help="Training batch size")
-    parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=0.0001, help="Learning rate")
-    parser.add_argument("--num-workers", type=int, default=0, help="Number of workers for data loaders") #CHECK LATER
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument("--experiment-id", type=str, default="attentionUnet-test-run", help="Experiment ID for Weights & Biases")
+    p = ArgumentParser("Training for medical ViT segmentation model")
+    p.add_argument("--dataset", type=str, choices=["hyperkvasir","endoscopy"], required=True)
+    p.add_argument("--model", type=str, default="unet")
+    p.add_argument("--image-size", type=int, nargs=2, default=None)
+    p.add_argument("--train-tf-kind", type=str, default="basic", choices=["basic","aug"])
+    p.add_argument("--val-tf-kind", type=str, default="basic", choices=["basic","aug"])
+    p.add_argument("--batch-size", type=int, default=4)
+    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--experiment-id", type=str, default="unet-baseline")
+    p.add_argument("--subset", type=int, default=0)
+    # p.add_argument("--overfit-one-batch", action="store_true")
+    return p
 
-    return parser
-
-
+# ---------- dataset ----------
 def create_dataset(args):
-
     data_root = get_data_root()
 
     train_tf = get_transforms(dataset=args.dataset, kind=args.train_tf_kind, image_size=args.image_size)
-    val_tf = get_transforms(args.dataset, kind=args.val_tf_kind, image_size=args.image_size)
+    val_tf   = get_transforms(dataset=args.dataset, kind=args.val_tf_kind,  image_size=args.image_size)
 
     if args.dataset == "hyperkvasir":
-        dataset_root = data_root / "HyperKvasir"
+        root = data_root / "HyperKvasir"
         num_classes = 1
-        train_ds = HyperKvasirDataset(root=dataset_root, split="train", transform=train_tf)
-        val_ds   = HyperKvasirDataset(root=dataset_root, split="validation", transform=val_tf)
+        train_ds = HyperKvasirDataset(root=root, split="train",       transform=train_tf)
+        val_ds   = HyperKvasirDataset(root=root, split="validation",  transform=val_tf)
 
     elif args.dataset == "endoscopy":
-        dataset_root = data_root / "endoscapes_segmentation_dataset\endoscapes_segmentations_processed"
-        ratio = (0.7, 0.2, 0.1)
-        train_ds = EndoscopyDataset(root=dataset_root, split="train", transform=train_tf, split_ratio=ratio, seed=args.seed)
-        val_ds   = EndoscopyDataset(root=dataset_root, split="train", transform=val_tf, split_ratio=ratio, seed=args.seed)
-        num_classes = 7
 
+        root = data_root / "endoscapes_segmentation_dataset" / "endoscapes_segmentations_processed"
+        ratio = (0.7, 0.2, 0.1)
+        train_ds = EndoscopyDataset(root=root, split="train", transform=train_tf, split_ratio=ratio, seed=args.seed)
+        val_ds   = EndoscopyDataset(root=root, split="validation",   transform=val_tf,   split_ratio=ratio, seed=args.seed)
+        num_classes = 7
 
     return train_ds, val_ds, num_classes
 
+# ---------- training ----------
 def train(args):
-
     wandb.login()
+    wandb.init(project="Internship-medical-vit-segmentation", name=args.experiment_id, config=vars(args))
 
-    wandb.init(
-        project="Internship-medical-vit-segmentation",
-        name=args.experiment_id,
-        config=vars(args),
-    )
-
-    # Create output directory if it doesn't exist
-    # Build the full path
-    output_dir = os.path.join(
-        "experiments",          # top-level experiments folder
-        args.dataset,           # dataset name (e.g., "hyperkvasir")
-        args.experiment_id,     # run name (e.g., "unet-baseline")
-        "checkpoints"           # store only checkpoint files here
-    )
-    os.makedirs(output_dir, exist_ok=True)    
+    out_dir = ckpt_dir(args)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     torch.manual_seed(args.seed)
-
-    # torch.backends.cudnn.deterministic = True
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     train_ds, val_ds, num_classes = create_dataset(args)
 
-    train_loader = DataLoader(train_ds,
-     batch_size=args.batch_size,
-     shuffle=True,
-     num_workers=args.num_workers,
-     collate_fn=list_data_collate,
-     pin_memory=torch.cuda.is_available())
+    if args.subset > 0:
+        train_ds = torch.utils.data.Subset(train_ds, list(range(args.subset)))
+        val_ds   = torch.utils.data.Subset(val_ds,   list(range(args.subset)))
 
-    val_loader = DataLoader(val_ds,
-     batch_size=args.batch_size,
-     num_workers=args.num_workers,
-     collate_fn=list_data_collate,
-     pin_memory=torch.cuda.is_available())
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                              num_workers=args.num_workers, collate_fn=list_data_collate,
+                              pin_memory=torch.cuda.is_available())
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
+                              num_workers=args.num_workers, collate_fn=list_data_collate,
+                              pin_memory=torch.cuda.is_available())
 
-    
-    model = build_model(
-        args.model,
-        in_channels=3,
-        out_channels=num_classes,
-        # channels=(16, 32, 64, 128, 256),
-        # num_res_units=2,
-    ).to(device)
+    # model = build_model(args.model, in_channels=3, out_channels=num_classes).to(device)
+    model = build_model( 
+    args.model, 
+    in_channels=3, 
+    out_channels=num_classes, # # You can pass extra kwargs if you want: 
+    vit_name="vit_base_patch16_224", 
+    pretrained=True, 
+    freeze_encoder=True, 
+    img_size=tuple(args.image_size) if args.image_size else (224,224), 
+     ).to(device)
 
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    criterion = DiceCELoss(include_background=False, to_onehot_y=True, softmax=True)  # robust for multiclass
+    dice_metric = DiceMetric(include_background=False, reduction="mean")
 
-
-    optimizer = torch.optim.Adam(model.parameters(), args.lr)
-    dice_metric = DiceMetric(include_background=False, reduction="mean") #See if you want background for binary or not
-    criterion = DiceLoss(num_classes)
-
+    # post-processing for metrics
     if num_classes == 1:
-        
         post_pred = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
-    elif num_classes > 1:
-        
-        post_pred = Compose([Activations(softmax=True), AsDiscrete(argmax=True, to_onehot=num_classes)])
+    else:
+        post_pred  = Compose([Activations(softmax=True), AsDiscrete(argmax=True, to_onehot=num_classes)])
         post_label = Compose([AsDiscrete(to_onehot=num_classes)])
- 
 
-    ### ---------Training Loop --------
+
+    # --------- Training loop ----------
     best_valid_loss = float('inf')
-    current_best_model_path = None
+    current_best = None
+
     for epoch in range(args.epochs):
-
-        # Training
         model.train()
-
         for i, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", leave=False)):
-
             images, labels = batch["image"].to(device), batch["label"].to(device)
-
             optimizer.zero_grad()
             outputs = model(images)
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
 
-            wandb.log({
-                "train_loss": loss.item(),
-                "learning_rate": optimizer.param_groups[0]['lr'],
-                "epoch": epoch + 1
-            }, step=epoch * len(train_loader) + i)
+            wandb.log({"train_loss": loss.item(), "lr": optimizer.param_groups[0]["lr"], "epoch": epoch+1},
+                      step=epoch*len(train_loader)+i)
 
-
-        # Validation
+        # --------- Validation ----------
         model.eval()
-
+        losses = []
         with torch.no_grad():
-            losses = []
             for i, batch in enumerate(val_loader):
-
                 images, labels = batch["image"].to(device), batch["label"].to(device)
-
                 outputs = model(images)
                 loss = criterion(outputs, labels)
                 losses.append(loss.item())
 
-                if i == 0:
-                    
+                # Log images once per epoch (first val batch)
+                if i == 1:
                     if num_classes == 1:
+                        preds = (outputs.sigmoid() > 0.5).float()
+                        images_grid = make_grid(images, nrow=2, normalize=True, scale_each=True)
+                        preds_grid  = make_grid(preds,  nrow=2, normalize=True, scale_each=True)
+                        labels_grid = make_grid(labels.float(), nrow=2, normalize=True, scale_each=True)
 
-                        predictions = torch.sigmoid(outputs)
-                        predictions = (predictions > 0.5).float()
-                        labels_grid = make_grid(labels, nrow=2, pad_value=1)
+                        wandb.log({
+                            "val_images/original":   wandb.Image(images_grid.permute(1,2,0).cpu().numpy()),
+                            "val_images/prediction": wandb.Image(preds_grid.permute(1,2,0).cpu().numpy()),
+                            "val_images/label":      wandb.Image(labels_grid.permute(1,2,0).cpu().numpy()),
+                        }, step=(epoch+1)*len(train_loader)-1)
+                    else:
+                        
+                                                # --- make index maps ---
+                        preds_idx = outputs.softmax(1).argmax(1)                  # [B,H,W]
+                        labs_idx  = labels.squeeze(1).long()                      # [B,H,W]
 
-                    elif num_classes > 1:
+                        # --- colorize to uint8 ---
+                        pred_rgb  = colorize_index_map(preds_idx)                 # [B,3,H,W], uint8
+                        lab_rgb   = colorize_index_map(labs_idx)                  # [B,3,H,W], uint8
 
-                        predictions = outputs.softmax(1).argmax(1)
-                        predictions = colorize_index_map(predictions)
-                        labels_colorized = colorize_index_map(labels.squeeze(1).long())
-                        labels_grid = make_grid(labels_colorized, nrow=2, pad_value=1)
+                        preds_idx = outputs.softmax(1).argmax(1)                   # [B,H,W]
+                        pred_rgb  = colorize_index_map(preds_idx)                  # uint8
+                        lab_rgb   = colorize_index_map(labels.squeeze(1).long())   # uint8
+                        # DO NOT normalize palette masks
+                        pred_grid_u8 = make_grid(pred_rgb, nrow=2, normalize=False)
+                        lab_grid_u8  = make_grid(lab_rgb,  nrow=2, normalize=False)
+                        img_grid     = make_grid(images,   nrow=2, normalize=True, scale_each=True)
 
-                    images_grid = make_grid(images, nrow=2, pad_value=1)
-                    predictions_grid = make_grid(predictions, nrow=2, pad_value=1)
+                        wandb.log({
+                            "val_images/original":   wandb.Image(img_grid.permute(1,2,0).cpu().numpy()),
+                            "val_images/prediction": wandb.Image(to_np_uint8(pred_grid_u8)),
+                            "val_images/label":      wandb.Image(to_np_uint8(lab_grid_u8)),
+                        }, step=(epoch+1)*len(train_loader)-1)
 
-                    wandb.log({
-                        "val_images/original_image": wandb.Image(images_grid.permute(1, 2, 0).cpu().numpy()),
-                        "val_images/predictions": wandb.Image(predictions_grid.permute(1, 2, 0).cpu().numpy()),
-                        "val_images/ground_truth": wandb.Image(labels_grid.permute(1, 2, 0).cpu().numpy())
-                    }, step=(epoch + 1) * len(train_loader) - 1)
-
-
-
-                outputs = [post_pred(x) for x in decollate_batch(outputs)]
-
+                # metric
+                y_pred = [post_pred(x) for x in decollate_batch(outputs)]
                 if num_classes == 1:
-                    labels = decollate_batch(labels)
-                elif num_classes > 1:
-                    labels = [post_label(x) for x in decollate_batch(labels)]
+                    y_true = decollate_batch(labels)
+                else:
+                    y_true = [post_label(x) for x in decollate_batch(labels)]
+                dice_metric(y_pred=y_pred, y=y_true)
 
-                dice_metric(y_pred=outputs, y=labels)
+        valid_loss = float(np.mean(losses))
+        dice = dice_metric.aggregate().item()
+        dice_metric.reset()
+        wandb.log({"valid_loss": valid_loss, "dice_score": dice},
+                  step=(epoch+1)*len(train_loader)-1)
 
-
-            valid_loss = sum(losses) / len(losses)
-            dice = dice_metric.aggregate().item()
-            dice_metric.reset()
-
-            wandb.log({
-                "valid_loss": valid_loss,
-                "dice_score": dice
-            }, step=(epoch + 1) * len(train_loader) - 1)
-
-
-            if valid_loss < best_valid_loss:
-                best_valid_loss = valid_loss
-                if current_best_model_path:
-                    os.remove(current_best_model_path)
-                current_best_model_path = os.path.join(
-                    output_dir, 
-                    f"best_model-epoch={epoch:04}-val_loss={valid_loss:04}.pth"
-                )
-                torch.save(model.state_dict(), current_best_model_path)
+        # checkpoints
+        if valid_loss < best_valid_loss:
+            best_valid_loss = valid_loss
+            if current_best and os.path.exists(current_best):
+                os.remove(current_best)
+            current_best = out_dir / f"best_model-epoch={epoch:04d}-val_loss={valid_loss:.4f}.pth"
+            torch.save(model.state_dict(), current_best)
 
     print("Training completed!")
-
-    # Save the model
-    torch.save(
-        model.state_dict(),
-        os.path.join(
-            output_dir,
-            f"final_model-epoch={epoch:04}-val_loss={valid_loss:04}.pth"
-        )
-    )
-
+    final_path = out_dir / f"final_model-epoch={epoch:04d}-val_loss={valid_loss:.4f}.pth"
+    torch.save(model.state_dict(), final_path)
     wandb.finish()
 
-
 if __name__ == "__main__":
-    parser = get_args_parser()
-    args = parser.parse_args()
+    args = get_args_parser().parse_args()
     train(args)
-
-
-
-#     python your_script.py \
-#   --dataset endoscopy \
-#   --data-dir ./my_data \
-#   --train-tf-kind aug \
-#   --val-tf-kind basic
-

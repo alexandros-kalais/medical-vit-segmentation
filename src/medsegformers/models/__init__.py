@@ -16,3 +16,4 @@ __all__ = ["register", "build"]
 
 
 from . import unet
+from . import vit_linear
