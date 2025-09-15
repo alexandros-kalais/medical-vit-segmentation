@@ -1,10 +1,10 @@
 $env:PYTHONPATH = "src"
 
 $dataset = "endoscopy"
-$model   = "unet"
-$imageH  = 256
-$imageW  = 256
-$ckpt    = ".\experiments\endoscopy\unet-baseline\checkpoints\best_model-epoch=0002-val_loss=0.8095954690856495.pth"
+$model   = "vit_linear"
+$imageH  = 224
+$imageW  = 224
+$ckpt    = ".\experiments\endoscopy\vit_linear-\checkpoints\final_model-epoch=0049-val_loss=1.0741.pth"
 
 python -m medsegformers.evaluate `
   --dataset $dataset `
