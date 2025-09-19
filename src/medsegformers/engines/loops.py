@@ -15,7 +15,7 @@ def train_one_epoch(
     epoch: int,
     epochs: int,
     wandb_run=None,
-    global_step_start: int = 0,  # NEW
+    global_step_start: int = 0,
 ) -> float:
     model.train()
     running = []
@@ -31,7 +31,7 @@ def train_one_epoch(
 
         running.append(loss.item())
         if wandb_run:
-            step = global_step_start + i  # monotonic step
+            step = global_step_start + i
             wandb_run.log(
                 {"train_loss": loss.item(), "lr": optimizer.param_groups[0]["lr"], "epoch": epoch+1},
                 step=step
@@ -60,11 +60,10 @@ def validate_one_epoch(
             loss = criterion(outputs, labels)
             losses.append(loss.item())
 
-            # log images once (first batch) — step is provided by the trainer via the lambda
+            
             if wandb_image_logger and i == 1:
                 wandb_image_logger(images, labels, outputs)
 
-            # metric
             y_pred = [post_pred(x) for x in decollate_batch(outputs)]
             if num_classes == 1:
                 y_true = decollate_batch(labels)

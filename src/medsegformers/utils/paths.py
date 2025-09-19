@@ -1,7 +1,6 @@
 from pathlib import Path
 
 def project_root() -> Path:
-    # assuming this file is under src/medsegformers/utils/paths.py
     return Path(__file__).resolve().parents[3]
 
 def get_data_root() -> Path:

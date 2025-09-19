@@ -1,4 +1,3 @@
-# transforms.py
 from monai.transforms import (
     Compose, LoadImaged, EnsureChannelFirstd, ScaleIntensityd,
     RandFlipd, RandRotate90d, RandAffined, Resized, Lambdad, EnsureTyped
@@ -6,7 +5,6 @@ from monai.transforms import (
 import numpy as np
 import torch
 
-# ----- dataset-specific mask preprocessors -----
 def binary_mask_preprocess(x: np.ndarray):
     """
     Input x can be (H,W) or (C,H,W). Ensure single channel and binarize.
@@ -18,7 +16,6 @@ def binary_mask_preprocess(x: np.ndarray):
         x = x[:1, ...]
     return (x > 0).astype(np.float32)
 
-# palette used for visualization AND RGB masks
 PALETTE = np.array([
     [  0,   0,   0],  # 0 background
     [255,   0,   0],  # 1 cystic plate
@@ -30,22 +27,15 @@ PALETTE = np.array([
 ], dtype=np.uint8)
 
 def mask_to_indices_endoscopy(x: np.ndarray) -> np.ndarray:
-    """
-    Robustly convert an Endoscopy mask to index map [1,H,W] int64 in [0..6].
-    Handles both single-channel indexed masks and 3-channel RGB masks.
-    """
-    # ensure channel-first
+
     if x.ndim == 2:
         x = x[None, ...]
     c, h, w = x.shape
 
-    # Case A: already indexed (single channel)
     if c == 1:
         y = x.astype(np.int64)
-        # If values are e.g. 0..6 we're good; otherwise just return as-is
         return y  # [1,H,W], int64
 
-    # Case B: true RGB mask
     if c == 3:
         rgb = np.moveaxis(x, 0, -1).astype(np.uint8)  # (H,W,3)
         y = np.zeros((h, w), dtype=np.int64)
@@ -106,6 +96,5 @@ def get_transforms(dataset: str, kind="basic", image_size=None):
             ),
         ]
 
-    # ALWAYS LAST: ensure final dtypes (float image, long label)
     tfs += [EnsureTyped(keys=("image", "label"), dtype=(torch.float32, torch.long))]
     return Compose(tfs)

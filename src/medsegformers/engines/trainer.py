@@ -50,7 +50,7 @@ class Trainer:
                 "val_images/original":   wandb.Image(images_grid.permute(1,2,0).cpu().numpy()),
                 "val_images/prediction": wandb.Image(preds_grid.permute(1,2,0).cpu().numpy()),
                 "val_images/label":      wandb.Image(labels_grid.permute(1,2,0).cpu().numpy()),
-            }, step=step, commit=False)  # commit=False so metrics can share the same step
+            }, step=step, commit=False) 
         else:
             preds_idx = outputs.softmax(1).argmax(1)                   # [B,H,W]
             pred_rgb  = colorize_index_map(preds_idx)                   # uint8
@@ -66,20 +66,20 @@ class Trainer:
 
     def fit(self):
         steps_per_epoch = len(self.train_loader)
-        global_step = 0  # single source of truth for steps
+        global_step = 0
 
         for epoch in range(self.args.epochs):
             # ---- Train ----
             train_loss = train_one_epoch(
                 self.model, self.train_loader, self.optimizer, self.criterion,
                 self.device, epoch, self.args.epochs, wandb_run=self.wandb,
-                global_step_start=global_step,  # NEW
+                global_step_start=global_step,
             )
 
             # ---- Validate ----
-            val_step = global_step + steps_per_epoch - 1  # Last step of this epoch's training
+            val_step = global_step + steps_per_epoch - 1
 
-            global_step += steps_per_epoch  # next free step after this epoch's training
+            global_step += steps_per_epoch
 
             valid_loss, dice = validate_one_epoch(
                 self.model, self.val_loader, self.criterion, self.device, self.num_classes,
@@ -95,9 +95,11 @@ class Trainer:
                 self.best_valid_loss = valid_loss
                 if self._current_best_path and os.path.exists(self._current_best_path):
                     os.remove(self._current_best_path)
-                self._current_best_path = str(self.out_dir / f"best_model-epoch={epoch:04d}-val_loss={valid_loss:.4f}.pth")
+                tag = f"{self.args.vit_name}_{self.args.decoder}_{self.args.image_size[0]}x{self.args.image_size[1]}"
+                self._current_best_path = str(self.out_dir / f"best-{tag}-epoch={epoch:04d}-val_loss={valid_loss:.4f}.pth")
                 torch.save(self.model.state_dict(), self._current_best_path)
 
-        final_path = str(self.out_dir / f"final_model-epoch={self.args.epochs-1:04d}-val_loss={valid_loss:.4f}.pth")
+        tag = f"{self.args.vit_name}_{self.args.decoder}_{self.args.image_size[0]}x{self.args.image_size[1]}"
+        final_path = str(self.out_dir / f"final-{tag}-epoch={self.args.epochs-1:04d}-val_loss={valid_loss:.4f}.pth")
         torch.save(self.model.state_dict(), final_path)
         return final_path, self._current_best_path

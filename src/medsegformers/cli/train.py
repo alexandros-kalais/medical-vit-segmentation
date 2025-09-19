@@ -14,22 +14,15 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # --- dataset prep via registry + class API ---
     DatasetCls = get_dataset_class(args.dataset)
-
-    data_root = get_data_root()
-    root = DatasetCls.default_root(data_root)
+    root = DatasetCls.default_root(get_data_root())
 
     train_tf = get_transforms(dataset=args.dataset, kind=args.train_tf_kind, image_size=args.image_size)
     val_tf   = get_transforms(dataset=args.dataset, kind=args.val_tf_kind,  image_size=args.image_size)
 
-    # Let each class handle its own defaults (e.g., split_ratio for Endoscopy)
-    train_ds = DatasetCls.build_split("train",      transform=train_tf, root=root, seed=args.seed)
-    val_ds   = DatasetCls.build_split("validation", transform=val_tf,   root=root, seed=args.seed)
-
+    train_ds = DatasetCls.build_split("train", transform=train_tf, root=root, seed=args.seed)
+    val_ds   = DatasetCls.build_split("validation", transform=val_tf, root=root, seed=args.seed)
     num_classes = getattr(DatasetCls, "NUM_CLASSES", None)
-    if num_classes is None:
-        raise AttributeError(f"{DatasetCls.__name__} must define class attribute NUM_CLASSES.")
 
     if args.subset > 0:
         train_ds = torch.utils.data.Subset(train_ds, list(range(args.subset)))
@@ -47,8 +40,7 @@ def main():
         num_classes=num_classes,
         vit_name=args.vit_name,
         pretrained=True,
-        freeze_encoder=args.freeze_encoder,
-        image_size = args.image_size[0]
+        freeze_encoder=args.freeze_encoder
     ).to(device)
 
     wandb.login()

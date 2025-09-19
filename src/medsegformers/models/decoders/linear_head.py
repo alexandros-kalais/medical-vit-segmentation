@@ -2,7 +2,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from . import register
 
-@register
+@register("linear", input_kind="single")
 class LinearHead(nn.Module):
     DECODER_NAME = "linear"
     def __init__(self, in_channels: int, num_classes: int, upsample_factor: int):

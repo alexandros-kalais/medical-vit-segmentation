@@ -1,4 +1,3 @@
-from __future__ import annotations
 from typing import Tuple, Optional
 from pathlib import Path
 import numpy as np
@@ -27,7 +26,7 @@ class Evaluator:
             self.post_label     = Compose([AsDiscrete(to_onehot=num_classes)])
             self.post_label_iou = self.post_label
 
-        # per-image, per-class metrics (we’ll average later)
+        # per-image, per-class metrics
         self.dice_metric = DiceMetric(include_background=True,  reduction="none")
         self.miou_metric = MeanIoU   (include_background=True,  reduction="none")
         self.hd95_metric = HausdorffDistanceMetric(include_background=True, percentile=95.0, directed=False, reduction="none")
@@ -56,7 +55,7 @@ class Evaluator:
 
             self.dice_metric(y_pred=dice_preds, y=dice_labels)
 
-            # IoU / HD95 use one-hot for both cases (binary → 2 classes)
+            # IoU / HD95 use one-hot for both cases
             if self.num_classes == 1:
                 iou_preds  = [self.post_pred_iou(x)  for x in decollate_batch(outputs)]
                 iou_labels = [self.post_label_iou(x) for x in decollate_batch(labels)]
@@ -66,7 +65,7 @@ class Evaluator:
             self.miou_metric(y_pred=iou_preds, y=iou_labels)
             self.hd95_metric(y_pred=iou_preds, y=iou_labels)
 
-        # aggregate (per-image, per-class → average over images)
+        # aggregate
         dice_raw = self.dice_metric.aggregate().cpu().numpy()   # [N, C]
         miou_raw = self.miou_metric.aggregate().cpu().numpy()   # [N, C]
         hd95_raw = self.hd95_metric.aggregate().cpu().numpy()   # [N, C]
@@ -81,7 +80,7 @@ class Evaluator:
         if self.num_classes == 1:
             class_names = ["foreground"]
         else:
-            class_names = ENDOSCOPY_CLASS_NAMES  # includes background at idx 0
+            class_names = ENDOSCOPY_CLASS_NAMES
 
         # per-class report
         for c, cname in enumerate(class_names):
@@ -96,7 +95,7 @@ class Evaluator:
         mean_hd95 = np.nanmean(hd95_cls).item() if hd95_cls.size else float("nan")
         print(f"{'Overall Average':>20} | Dice: {mean_dice:0.4f} | mIoU: {mean_miou:0.4f} | HD95 (px): {mean_hd95:0.3f}")
 
-        return dice_cls, miou_cls, hd95_cls  # in case you want to consume programmatically
+        return dice_cls, miou_cls, hd95_cls
 
     def _reset(self):
         self.dice_metric.reset()

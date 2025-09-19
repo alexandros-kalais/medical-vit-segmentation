@@ -1,14 +1,19 @@
 $env:PYTHONPATH = "src"
 
 $dataset = "endoscopy"
-$model   = "vit_linear"
 $imageH  = 224
 $imageW  = 224
-$ckpt    = ".\experiments\endoscopy\vit_linear-\checkpoints\final_model-epoch=0049-val_loss=1.0741.pth"
+$decoder = "naive"
+$encoder = "vit_base_patch14_dinov2"
+$ckpt    = ".\experiments\endoscopy\vit_dinov2_linear\checkpoints\best_model-epoch=0021-val_loss=0.9841.pth"
 
 python -m medsegformers.cli.eval `
   --dataset $dataset `
-  --model $model `
   --image-size $imageH $imageW `
-  --batch-size 4 `
-  --checkpoint "$ckpt"
+  --batch-size 8 `
+  --checkpoint "$ckpt" `
+  --decoder $decoder `
+  --vit-name $encoder `
+
+
+#"vit_base_patch14_dinov2"
