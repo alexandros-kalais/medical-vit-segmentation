@@ -6,7 +6,7 @@ from . import register
 @register("mla", input_kind="multi")
 class MLAHead(nn.Module):
     """
-    SETR-MLA (standalone, generic).
+    SETR-MLA
     inputs: List[Tensor] of length M, each (N, C_in, H', W')  # same H', W' for all streams
     Steps (per stream):
       1) 1x1 conv (C_in -> mla_channels)

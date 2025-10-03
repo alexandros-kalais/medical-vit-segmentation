@@ -220,3 +220,11 @@ playground/
 
 debug.py
 tests/
+
+scripts/
+
+Internship-medical-vit-segmentation/
+
+experiments/
+
+lightning_logs/

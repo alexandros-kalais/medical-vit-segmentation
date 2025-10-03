@@ -62,7 +62,7 @@ def get_transforms(dataset: str, kind="basic", image_size=None):
         tfs += [
             Lambdad(keys="label", func=binary_mask_preprocess),
         ]
-    elif dataset == "endoscopy":  # multi-class masks
+    elif dataset == "endoscopy" or dataset == "endoscopy_eomt":  # multi-class masks
         tfs += [
             Lambdad(keys="label", func=mask_to_indices_endoscopy),
         ]

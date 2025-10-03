@@ -14,7 +14,7 @@ class FlexDiceLoss(nn.Module):
             sigmoid=(num_classes == 1),
             softmax=(num_classes > 1),
             to_onehot_y=(num_classes > 1),
-            include_background=include_background,
+            include_background=True,
             reduction=reduction,
         )
 

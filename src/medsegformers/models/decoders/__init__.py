@@ -20,10 +20,8 @@ def register(name: str = None, input_kind: str = "single"):
         if key in _DECODER_REGISTRY and _DECODER_REGISTRY[key].cls is not cls:
             raise ValueError(f"Decoder '{key}' already registered")
 
-        # put spec in registry
         _DECODER_REGISTRY[key] = DecoderSpec(name=key, cls=cls, input_kind=input_kind)
 
-        # also attach attributes to the class for introspection
         setattr(cls, "DECODER_NAME", key)
         setattr(cls, "INPUT_KIND", input_kind)
         return cls
@@ -36,17 +34,14 @@ def build(name: str, **kwargs):
         raise KeyError(f"Unknown decoder '{name}'. Available: {avail}")
     return _DECODER_REGISTRY[key].cls(**kwargs)
 
-def list_decoders():
-    return sorted(_DECODER_REGISTRY.keys())
-
 def get_decoder_info(name: str) -> DecoderSpec:
     return _DECODER_REGISTRY[name.lower()]
 
 
-__all__ = ["register", "build", "list_decoders", "get_decoder_info"]
+__all__ = ["register", "build", "get_decoder_info"]
 
 from .linear_head import LinearHead
 from .setr_naive_head import NaiveHead
 from .setr_pup_head import PUPHead
 from .setr_mla_head import MLAHead
-from .mask_transformer_head import MaskTransformerHead
+from .segmenter_transformer_head import MaskTransformerHead

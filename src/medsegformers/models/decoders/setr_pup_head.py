@@ -5,8 +5,8 @@ from . import register
 @register("pup", input_kind="single")
 class PUPHead(nn.Module):
     """
-    PUP (Progressive UPsampling) for ViT/14:
-      fmap (N, C, H', W') with H' = H/14, W' = W/14
+    PUP (Progressive UPsampling) for ViT/patch size:
+      fmap (N, C, H', W') with H' = H/patch size, W' = W/patch size
       -> [3x3 Conv -> SyncBN -> ReLU -> 2x upsample] x 3  (H': *8)
       -> 3x3 Conv -> SyncBN -> ReLU -> 1x1 Conv
       -> final upsample to (H, W) computed as (H'*patch, W'*patch)
@@ -14,11 +14,11 @@ class PUPHead(nn.Module):
     """
 
     def __init__(self, in_channels: int, num_classes: int,
-                 upsample_factor: int,          # patch size, e.g., 14
+                 upsample_factor: int,          # patch size
                  mid_channels: int = 256,
                  align_corners: bool = False):
         super().__init__()
-        self.patch = int(upsample_factor)      # e.g., 14
+        self.patch = int(upsample_factor)
         self.align_corners = align_corners
 
         def block(in_c, out_c):
