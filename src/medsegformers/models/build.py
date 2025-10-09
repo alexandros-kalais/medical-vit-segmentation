@@ -16,13 +16,20 @@ def build_segmentation_model(
     indices: Tuple[int, ...] = (1, 4, 7, 12),
     image_size: Tuple[int, int] = (224, 224),
 ) -> nn.Module:
-    # Read decoder information
+    
     spec = get_decoder_info(decoder)
+
+    if any(x in vit_name.lower() for x in ["16-", "16_"]):
+        patch_size = 16
+    elif any(x in vit_name.lower() for x in ["14_"]):
+        patch_size = 14
+    else:
+        raise ValueError("Define patch_size correctly!")
 
     # Build ViT (don't reference `vit` before it's created)
     vit = ViT(
         img_size=image_size,
-        patch_size=16,  # or parse from vit_name if needed
+        patch_size=patch_size,  # or parse from vit_name if needed
         backbone_name=vit_name,
         ckpt_path=None if pretrained else "",  # if you want manual ckpt loading
     )
@@ -36,6 +43,9 @@ def build_segmentation_model(
                 if isinstance(mod, (nn.LayerNorm, nn.BatchNorm2d, nn.GroupNorm)):
                     for p in mod.parameters():
                         p.requires_grad_(False)
+    else:
+        for p in vit.backbone.parameters():
+            p.requires_grad = True
 
     enc = Encoder(
         encoder=vit,

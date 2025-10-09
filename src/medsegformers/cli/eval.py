@@ -8,6 +8,10 @@ from medsegformers.models import build_segmentation_model
 from medsegformers.utils.paths import get_data_root
 from medsegformers.engines.evaluator import Evaluator
 
+"""
+NEED TO CHANGE THIS!
+"""
+
 def main():
     args = get_eval_args_parser().parse_args()
 

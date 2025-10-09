@@ -12,7 +12,7 @@ def binary_mask_preprocess(x: np.ndarray):
     """
     if x.ndim == 2:
         x = x[None, ...]
-    if x.shape[0] > 1:  # e.g. RGB mask -> take first channel
+    if x.shape[0] > 1: 
         x = x[:1, ...]
     return (x > 0).astype(np.float32)
 
@@ -34,10 +34,10 @@ def mask_to_indices_endoscopy(x: np.ndarray) -> np.ndarray:
 
     if c == 1:
         y = x.astype(np.int64)
-        return y  # [1,H,W], int64
+        return y 
 
     if c == 3:
-        rgb = np.moveaxis(x, 0, -1).astype(np.uint8)  # (H,W,3)
+        rgb = np.moveaxis(x, 0, -1).astype(np.uint8)
         y = np.zeros((h, w), dtype=np.int64)
         for idx, color in enumerate(PALETTE):
             matches = np.all(rgb == color, axis=-1)
@@ -57,19 +57,17 @@ def get_transforms(dataset: str, kind="basic", image_size=None):
         EnsureChannelFirstd(keys=keys_imglab),
     ]
 
-    # dataset-specific mask preprocessing
     if dataset == "hyperkvasir":  # binary masks
         tfs += [
             Lambdad(keys="label", func=binary_mask_preprocess),
         ]
-    elif dataset == "endoscopy" or dataset == "endoscopy_eomt":  # multi-class masks
+    elif dataset == "endoscopy" or dataset == "endoscopy_eomt":
         tfs += [
             Lambdad(keys="label", func=mask_to_indices_endoscopy),
         ]
     else:
         raise ValueError(f"Unknown dataset {dataset}")
 
-    # shared extras
     if kind in ("basic", "aug"):
         tfs += [ScaleIntensityd(keys="image")]
 
@@ -78,7 +76,7 @@ def get_transforms(dataset: str, kind="basic", image_size=None):
             Resized(
                 keys=keys_imglab,
                 spatial_size=image_size,
-                mode=("bilinear", "nearest"),  # image bilinear, label nearest
+                mode=("bilinear", "nearest"),
             ),
         ]
 

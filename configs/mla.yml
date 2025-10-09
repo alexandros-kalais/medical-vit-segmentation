@@ -1,0 +1,26 @@
+experiment_id: auto
+dataset: endoscopy
+
+vit_name: facebook/dinov3-vits16-pretrain-lvd1689m
+decoder: mla
+image_size: [224, 224]
+
+# optimization
+lr: 0.0001
+llrd: 0.8
+lr_multi: 2.0
+poly_power: 0.9
+weight_decay: 0.05
+epochs: 50
+batch_size: 4
+num_workers: 0
+freeze_encoder: False
+unfreeze_last_k: 0
+
+# training setup
+train_tf_kind: aug
+val_tf_kind: basic
+
+# optional
+seed: 42
+subset: 0

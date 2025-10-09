@@ -117,4 +117,4 @@ class MaskClassificationLoss(Mask2FormerLoss):
 
         log_fn("losses/train_loss_total", loss_total, sync_dist=True, prog_bar=True)
 
-        return loss_total  # type: ignore
+        return loss_total  

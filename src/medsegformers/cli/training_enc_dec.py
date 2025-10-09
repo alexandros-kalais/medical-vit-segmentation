@@ -1,22 +1,35 @@
 import lightning as L
 import torch
 from monai.data import DataLoader
-
+from pathlib import Path
 from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.callbacks import ModelCheckpoint
+import json
+import sys
+from datetime import datetime
 
-from medsegformers.config.args import get_train_args_parser
 from medsegformers.data import get_dataset_class
 from medsegformers.transforms import get_transforms                         
-from medsegformers.utils.paths import get_data_root
+from medsegformers.utils.paths import get_data_root, ckpt_dir
 from medsegformers.models.build import build_segmentation_model   
 from medsegformers.engines.enc_dec_lightning import EncoderDecoderSegModule
+from medsegformers.cli.config import load_config
 
 
 def main():
-    args = get_train_args_parser().parse_args()
+    # 1. Load experiment config
+    cfg_path = None
+    for arg in sys.argv:
+        if arg.endswith("yml") or arg.endswith(".yaml"):
+            cfg_path = arg
+            break
+    if cfg_path is None:
+        raise ValueError("Plese provide a config YAML path")
 
-    # ---- runtime (same defaults spirit as your EoMT script)
-    L.seed_everything(getattr(args, "seed", 42), workers=True)
+    args = load_config(cfg_path)
+
+    # 2. Runtime setup 
+    L.seed_everything(args.seed, workers=True)
     use_gpu = torch.cuda.is_available()
     accelerator = "gpu" if use_gpu else "cpu"
     devices = 1
@@ -25,6 +38,7 @@ def main():
     DatasetCls = get_dataset_class(args.dataset)
     root = DatasetCls.default_root(get_data_root())
 
+    # 3. Transforms and Data
     tf_train = get_transforms(dataset=args.dataset, kind=args.train_tf_kind, image_size=args.image_size)
     tf_val   = get_transforms(dataset=args.dataset, kind=args.val_tf_kind,   image_size=args.image_size)
 
@@ -32,6 +46,7 @@ def main():
     val_ds   = DatasetCls(split="validation", transform=tf_val,   root=root, seed=args.seed, return_masks=False)
 
     num_classes = getattr(DatasetCls, "NUM_CLASSES", None)
+
     if num_classes is None:
         raise ValueError("Dataset class must define NUM_CLASSES")
     
@@ -41,41 +56,97 @@ def main():
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=getattr(args, "num_workers", 0), pin_memory=use_gpu
+        num_workers=args.num_workers, pin_memory=use_gpu
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=getattr(args, "num_workers", 0), pin_memory=use_gpu
+        num_workers=args.num_workers, pin_memory=use_gpu
     )
 
-    # ---- model (unified builder you added)
+    # 4. Model
     model = build_segmentation_model(
         decoder=args.decoder,                 # e.g. "naive" | "mla" | "pup" ...
         num_classes=num_classes,
         vit_name=args.vit_name,
         pretrained=True,
-        freeze_encoder=getattr(args, "freeze_encoder", True),
+        freeze_encoder=args.freeze_encoder,
         image_size=tuple(args.image_size),
-        patch_size=16,
         decoder_kwargs=getattr(args, "decoder_kwargs", None),
-    )  # :contentReference[oaicite:11]{index=11}
+        unfreeze_last_k=args.unfreeze_last_k
+    ) 
 
-    # ---- Lightning module for ED
+    steps_per_epoch = len(train_loader)
+    total_steps = steps_per_epoch * args.epochs
+
+    non_vit_warmup = int(total_steps * 0.05)
+    vit_warmup = int(total_steps * 0.15)       
+    warmup_steps = (non_vit_warmup, vit_warmup)
+
+    print(f"[INFO] steps_per_epoch={steps_per_epoch}, total_steps={total_steps}")
+    print(f"[INFO] warmup_steps (non_vit, vit) = {warmup_steps}")
+
     module = EncoderDecoderSegModule(
         network=model,
         num_classes=num_classes,
         lr=args.lr,
-        weight_decay=getattr(args, "weight_decay", 0.05),
-        ignore_index=getattr(args, "ignore_index", None),
+        weight_decay=args.weight_decay,
+        llrd = args.llrd,
+        lr_multi = args.lr_multi,
+        poly_power = args.poly_power,
+        warmup_steps=warmup_steps
     )
 
-    # ---- W&B logger (same project/name convention as your EoMT script)
+
+    if not hasattr(args, "experiment_id") or args.experiment_id in [None, "", "auto"]:
+        timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+        vit_name_lower = args.vit_name.lower()
+        # Extract model family + size safely
+        if "dinov3" in vit_name_lower:
+            vit_short = "dinov3"
+        elif "dinov2" in vit_name_lower:
+            vit_short = "dinov2"
+        decoder_short = args.decoder
+        args.experiment_id = f"{decoder_short}_{vit_short}_{args.image_size[0]}_{args.image_size[0]}_lr{args.lr}_bs{args.batch_size}_{timestamp}"
+        print(f"[INFO] Auto experiment_id set to: {args.experiment_id}")
+
+
+
+     # 5. Logging and checkpoints
     wandb_logger = WandbLogger(
-        project=getattr(args, "wandb_project", "Internship-medical-vit-segmentation"),
+        project="Internship-medical-vit-segmentation",
         name=args.experiment_id,
         log_model=False,
     )
 
+    wandb_logger.experiment.config.update(vars(args))
+
+    run_dir = ckpt_dir(args.dataset, args.experiment_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    
+    ckpt_callback = ModelCheckpoint(
+    dirpath=str(run_dir),
+    filename="{epoch:03d}-{val_loss:.3f}-{mean_iou:.3f}",
+    monitor="mean_iou",
+    mode="max",
+    save_top_k=1,
+    save_last=True,
+)
+
+    run_config = vars(args).copy()
+    run_config.update({
+    "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "steps_per_epoch": steps_per_epoch,
+    "total_steps": total_steps,
+    "warmup_steps": {
+        "non_vit_warmup": non_vit_warmup,
+        "vit_warmup": vit_warmup
+        }
+    })
+
+    with open(run_dir / "run_config.json", "w") as f:
+        json.dump(run_config, f, indent=4)
+
+    # 6 Trainer
     trainer = L.Trainer(
         accelerator=accelerator,
         devices=devices,
@@ -84,8 +155,9 @@ def main():
         log_every_n_steps=10,
         num_sanity_val_steps=0,
         logger=wandb_logger,
+        callbacks=[ckpt_callback]
     )
-
+    
     trainer.fit(module, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
     try:

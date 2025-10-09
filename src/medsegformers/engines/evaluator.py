@@ -9,6 +9,12 @@ from tqdm import tqdm
 
 from medsegformers.utils.vis import ENDOSCOPY_CLASS_NAMES
 
+
+"""
+
+NEEDS TO BE CHANGED
+
+"""
 class Evaluator:
     def __init__(self, model: torch.nn.Module, num_classes: int, device: torch.device):
         self.model = model

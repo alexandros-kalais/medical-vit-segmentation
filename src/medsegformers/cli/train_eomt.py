@@ -140,6 +140,7 @@ def main():
     val_ds   = DatasetCls(split = "validation", transform=val_tf,   root=root, seed=args.seed, return_masks = True)
 
     num_classes = getattr(DatasetCls, "NUM_CLASSES", None)
+
     if num_classes is None:
         raise ValueError("Dataset class must define NUM_CLASSES")
     
@@ -200,7 +201,7 @@ def main():
 
     anneal_starts = scale_milestones(total_steps, starts_frac)
     anneal_ends = scale_milestones(total_steps, ends_frac)
-    warm_steps = scale_milestones(total_steps, [0.05, 0.10])
+    warm_steps = scale_milestones(total_steps, [0.08, 0.15])
 
     print(f"steps_per_epoch={steps_per_epoch}, total_steps={total_steps}")
     print("anneal_starts:", anneal_starts)
@@ -243,7 +244,7 @@ def main():
         attn_mask_annealing_enabled=not bool(getattr(args, "eomt_disable_masked_attn", False)),
         lr=args.lr,
         llrd=getattr(args, "llrd", 1.0),
-        lr_mult=getattr(args, "lr_mult", 0.1),
+        lr_mult=getattr(args, "lr_mult", 1.0),
         warmup_steps=warm_steps,
         ignore_idx=getattr(args, "ignore_index", 255),
         attn_mask_annealing_start_steps=anneal_starts,

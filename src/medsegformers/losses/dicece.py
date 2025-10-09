@@ -2,9 +2,7 @@ import torch.nn as nn
 from monai.losses import DiceCELoss
 
 class FlexDiceCELoss(nn.Module):
-    """
-    Dice + Cross-Entropy that adapts to binary or multi-class.
-    """
+
     def __init__(
         self,
         num_classes: int,
