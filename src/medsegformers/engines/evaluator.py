@@ -1,23 +1,67 @@
-from typing import Tuple, Optional
-from pathlib import Path
 import numpy as np
 import torch
+from typing import Dict, Tuple, Optional
 from monai.data import decollate_batch
 from monai.transforms import Compose, Activations, AsDiscrete
 from monai.metrics import DiceMetric, MeanIoU, HausdorffDistanceMetric
-from tqdm import tqdm
-
 from medsegformers.utils.vis import ENDOSCOPY_CLASS_NAMES
 
+import copy, time
+import numpy as np
+import torch
+from fvcore.nn import FlopCountAnalysis
 
-"""
+def _count_params_total(model: torch.nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters())
 
-NEEDS TO BE CHANGED
+def _compute_flops(model: torch.nn.Module, input_shape) -> int:
 
-"""
+    model_cpu = copy.deepcopy(model).cpu().eval()
+    x_cpu = torch.randn(*input_shape)  # CPU tensor
+    flops = FlopCountAnalysis(model_cpu, x_cpu).total()
+    return int(flops)
+
+def _measure_fps_gpu(
+    model: torch.nn.Module,
+    input_shape,
+    device: torch.device,
+    warmup: int = 10,
+    runs: int = 50,
+    amp_dtype: torch.dtype | None = torch.bfloat16,  # good default for A100/H100
+) -> float:
+
+    assert device.type == "cuda", "GPU timing requires CUDA device"
+    model.eval().to(device)
+    x = torch.randn(*input_shape, device=device)
+
+    torch.backends.cudnn.benchmark = True
+
+    with torch.no_grad(), torch.cuda.amp.autocast(dtype=amp_dtype) if amp_dtype else torch.no_grad():
+        for _ in range(warmup):
+            _ = model(x)
+    torch.cuda.synchronize()
+
+    times = []
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event   = torch.cuda.Event(enable_timing=True)
+
+    with torch.no_grad(), torch.cuda.amp.autocast(dtype=amp_dtype) if amp_dtype else torch.no_grad():
+        for _ in range(runs):
+            start_event.record()
+            _ = model(x)
+            end_event.record()
+            torch.cuda.synchronize()
+            ms = start_event.elapsed_time(end_event)
+            times.append(ms / 1000.0)
+
+    med = float(np.median(times))
+    return 1.0 / med if med > 0 else float("nan")
+
+
 class Evaluator:
-    def __init__(self, model: torch.nn.Module, num_classes: int, device: torch.device):
-        self.model = model
+    def __init__(self, model: torch.nn.Module, num_classes: int, device: torch.device,
+                 compute_hd95: bool = True, include_background: bool = False):
+        self.model = model.to(device)
         self.num_classes = num_classes
         self.device = device
 
@@ -32,78 +76,97 @@ class Evaluator:
             self.post_label     = Compose([AsDiscrete(to_onehot=num_classes)])
             self.post_label_iou = self.post_label
 
-        # per-image, per-class metrics
-        self.dice_metric = DiceMetric(include_background=True,  reduction="none")
-        self.miou_metric = MeanIoU   (include_background=True,  reduction="none")
-        self.hd95_metric = HausdorffDistanceMetric(include_background=True, percentile=95.0, directed=False, reduction="none")
+        red = "none"
+        self.dice_metric = DiceMetric(include_background=include_background, reduction=red)
+        self.miou_metric = MeanIoU   (include_background=include_background, reduction=red)
+        self.compute_hd95 = compute_hd95
+        self.hd95_metric = None
+        if compute_hd95:
+            self.hd95_metric = HausdorffDistanceMetric(
+                include_background=include_background,
+                percentile=95.0, directed=False, reduction=red
+            )
 
-    def load_checkpoint(self, ckpt_path: str | Path):
-        ckpt = torch.load(Path(ckpt_path), map_location=self.device, weights_only=True)
-        self.model.load_state_dict(ckpt)
-        self.model.eval()
+    def efficiency(
+        self,
+        *,
+        input_shape: tuple,  # (1, 3, H, W)
+        warmup: int = 10,
+        runs: int = 50,
+        amp_dtype: torch.dtype | None = torch.bfloat16,
+        use_gpu: bool = True,
+    ):
+
+        total_params = sum(p.numel() for p in self.model.parameters())
+
+        flops = _compute_flops(self.model, input_shape)
+        gflops = float(flops) / 1e9 if flops is not None else None
+
+        if use_gpu and self.device.type == "cuda":
+            fps = _measure_fps_gpu(
+                self.model, input_shape, self.device, warmup=warmup, runs=runs, amp_dtype=amp_dtype
+            )
+        else:
+            fps = float("nan")
+
+        return {
+            "total_params": int(total_params),
+            "gflops": gflops,
+            "fps": float(fps),
+        }
 
     @torch.no_grad()
-    def run(self, loader, *, dataset: str):
-        device = self.device
-        model  = self.model
+    def run(self, loader, *, dataset_name: str) -> Dict:
+        self.model.eval()
+        for batch in loader:
+            images, labels = batch["image"].to(self.device), batch["label"].to(self.device)
+            logits = self.model(images)
 
-        for batch in tqdm(loader, desc="Evaluating", leave=False):
-            images, labels = batch["image"].to(device), batch["label"].to(device)
-            outputs = model(images)
-
-            # Dice inputs
             if self.num_classes == 1:
-                dice_preds  = [self.post_pred_dice(x) for x in decollate_batch(outputs)]
-                dice_labels = decollate_batch(labels)  # (B,1,H,W)
+                dice_preds  = [self.post_pred_dice(x) for x in decollate_batch(logits)]
+                dice_labels = decollate_batch(labels)
             else:
-                dice_preds  = [self.post_pred_dice(x) for x in decollate_batch(outputs)]
+                dice_preds  = [self.post_pred_dice(x) for x in decollate_batch(logits)]
                 dice_labels = [self.post_label(x)     for x in decollate_batch(labels)]
 
             self.dice_metric(y_pred=dice_preds, y=dice_labels)
 
-            # IoU / HD95 use one-hot for both cases
             if self.num_classes == 1:
-                iou_preds  = [self.post_pred_iou(x)  for x in decollate_batch(outputs)]
+                iou_preds  = [self.post_pred_iou(x)  for x in decollate_batch(logits)]
                 iou_labels = [self.post_label_iou(x) for x in decollate_batch(labels)]
             else:
                 iou_preds, iou_labels = dice_preds, dice_labels
 
             self.miou_metric(y_pred=iou_preds, y=iou_labels)
-            self.hd95_metric(y_pred=iou_preds, y=iou_labels)
+            if self.hd95_metric:
+                self.hd95_metric(y_pred=iou_preds, y=iou_labels)
 
-        # aggregate
-        dice_raw = self.dice_metric.aggregate().cpu().numpy()   # [N, C]
-        miou_raw = self.miou_metric.aggregate().cpu().numpy()   # [N, C]
-        hd95_raw = self.hd95_metric.aggregate().cpu().numpy()   # [N, C]
+        dice_raw = self.dice_metric.aggregate().cpu().numpy()
+        miou_raw = self.miou_metric.aggregate().cpu().numpy()
+        hd95_raw = self.hd95_metric.aggregate().cpu().numpy() if self.hd95_metric else None
 
-        self._reset()
+        self.dice_metric.reset()
+        self.miou_metric.reset()
+        if self.hd95_metric:
+            self.hd95_metric.reset()
 
         dice_cls = np.nanmean(dice_raw, axis=0) if dice_raw.size else np.array([])
         miou_cls = np.nanmean(miou_raw, axis=0) if miou_raw.size else np.array([])
-        hd95_cls = np.nanmean(hd95_raw, axis=0) if hd95_raw.size else np.array([])
+        hd95_cls = np.nanmean(hd95_raw, axis=0) if (hd95_raw is not None and hd95_raw.size) else np.array([])
 
-        # class names
         if self.num_classes == 1:
             class_names = ["foreground"]
         else:
-            class_names = ENDOSCOPY_CLASS_NAMES
+            if self.include_background == False:
+                class_names = ENDOSCOPY_CLASS_NAMES[1:]
 
-        # per-class report
-        for c, cname in enumerate(class_names):
-            d = dice_cls[c].item() if c < dice_cls.size else float("nan")
-            j = miou_cls[c].item() if c < miou_cls.size else float("nan")
-            h = hd95_cls[c].item() if hd95_cls.size and c < hd95_cls.size else float("nan")
-            print(f"{c:>2} {cname:>18} | Dice: {d:0.4f} | mIoU: {j:0.4f} | HD95 (px): {h:0.3f}")
-
-        # overall averages
-        mean_dice = np.nanmean(dice_cls).item() if dice_cls.size else float("nan")
-        mean_miou = np.nanmean(miou_cls).item() if miou_cls.size else float("nan")
-        mean_hd95 = np.nanmean(hd95_cls).item() if hd95_cls.size else float("nan")
-        print(f"{'Overall Average':>20} | Dice: {mean_dice:0.4f} | mIoU: {mean_miou:0.4f} | HD95 (px): {mean_hd95:0.3f}")
-
-        return dice_cls, miou_cls, hd95_cls
-
-    def _reset(self):
-        self.dice_metric.reset()
-        self.miou_metric.reset()
-        self.hd95_metric.reset()
+        result = {
+            "class_names": class_names,
+            "dice_per_class": dice_cls.tolist() if dice_cls.size else [],
+            "miou_per_class": miou_cls.tolist() if miou_cls.size else [],
+            "hd95_per_class": hd95_cls.tolist() if hd95_cls.size else [],
+            "mean_dice": float(np.nanmean(dice_cls)) if dice_cls.size else float("nan"),
+            "mean_miou": float(np.nanmean(miou_cls)) if miou_cls.size else float("nan"),
+            "mean_hd95": float(np.nanmean(hd95_cls)) if hd95_cls.size else float("nan"),
+        }
+        return result

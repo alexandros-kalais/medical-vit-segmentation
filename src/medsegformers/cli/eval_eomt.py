@@ -3,8 +3,11 @@ from pathlib import Path
 import torch
 from typing import Optional
 from monai.data import DataLoader
+import torch.nn as nn
+import torch.nn.functional as F
 
-from medsegformers.models.build import build_segmentation_model
+from medsegformers.models.vit import ViT
+from medsegformers.models.eomt import EoMT
 from medsegformers.transforms import get_transforms
 from medsegformers.utils.paths import get_experiments_root, get_data_root
 from medsegformers.data import get_dataset_class
@@ -27,12 +30,38 @@ def _pick_ckpt(ckpt_dir: Path) -> Optional[Path]:
     return non_last[0]
 
 def _load_network_weights_from_lightning_ckpt(model: torch.nn.Module, ckpt_path: Path, device: torch.device):
-    ckpt = torch.load(str(ckpt_path), map_location=device)
+    # If you trust the checkpoint source, just disable the safety gate:
+    ckpt = torch.load(str(ckpt_path), map_location=device, weights_only=False)
     sd = ckpt.get("state_dict", {})
     net_sd = {k[len("network."):]: v for k, v in sd.items() if k.startswith("network.")}
     missing, unexpected = model.load_state_dict(net_sd, strict=False)
     if missing or unexpected:
         print(f"[WARN] load_state_dict mismatches -> missing: {missing}, unexpected: {unexpected}")
+
+class EoMTSemanticWrapper(nn.Module):
+    """Wraps EoMT to output per-pixel class logits (B,C,H,W) from the FINAL block only."""
+    def __init__(self, eomt: EoMT, img_size: tuple[int, int]):
+        super().__init__()
+        self.eomt = eomt
+        self.img_size = img_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # EoMT returns lists per block: ([mask_logits_l], [class_logits_l])  (last item is final block)
+        mask_logits_list, class_logits_list = self.eomt(x)  # lists length = num_blocks (+1 if masked attn enabled) :contentReference[oaicite:5]{index=5}
+        mask_logits = mask_logits_list[-1]                  # (B, Q, h, w)
+        class_logits = class_logits_list[-1]                # (B, Q, C+1)  (+1 = "no object") :contentReference[oaicite:6]{index=6}
+
+        # Match Lightning eval behavior: upsample mask logits to the training image size before combining. :contentReference[oaicite:7]{index=7}
+        mask_logits = F.interpolate(mask_logits, size=self.img_size, mode="bilinear")
+
+        # Convert to per-pixel class logits (drop the "no object" column). :contentReference[oaicite:8]{index=8}
+        per_pixel = torch.einsum(
+            "bqhw,bqc->bchw",
+            mask_logits.sigmoid(),
+            class_logits.softmax(dim=-1)[..., :-1],
+        )
+        return per_pixel
+
 
 
 def main():
@@ -71,9 +100,10 @@ def main():
             cfg = json.load(f)
 
         image_size = tuple(cfg["image_size"])
-        vit_name   = cfg["vit_name"]
-        decoder    = cfg["decoder"]
+        vit_name   = cfg["vit_name"] 
         seed       = cfg.get("seed", 42)
+        eomt_num_blocks = cfg.get("eomt_num_blocks")
+        eomt_num_q = cfg.get("eomt_num_q")
 
         DatasetCls = get_dataset_class(args.dataset)
         root = DatasetCls.default_root(get_data_root())
@@ -87,21 +117,33 @@ def main():
             ds, batch_size=args.batch_size, shuffle=False,
             num_workers=args.num_workers)
 
-        # build & load weights
-        model = build_segmentation_model(
-            decoder=decoder,
-            num_classes=num_classes,
-            vit_name=vit_name,
-            pretrained=True,
-            freeze_encoder=False,
-            image_size=image_size,
-            decoder_kwargs=cfg.get("decoder_kwargs", None),
-            unfreeze_last_k=cfg.get("unfreeze_last_k", 0),
-        ).to(device)
-        _load_network_weights_from_lightning_ckpt(model, ckpt, device)
-        model.eval()
+        # 4. Model and Module 
 
+        H, W = image_size
+        if any(x in vit_name.lower() for x in ["16-", "16_"]):
+            patch_size = 16
+        elif any(x in vit_name.lower() for x in ["14_"]):
+            patch_size = 14
+        else:
+            raise ValueError("Define patch_size correctly!")
+
+        encoder = ViT(
+            img_size=(H, W),
+            patch_size=patch_size,
+            backbone_name=vit_name,
+            ckpt_path=getattr(args, "vit_ckpt", None),
+        )
+
+        network = EoMT(
+            encoder=encoder,
+            num_classes=num_classes,
+            num_q=eomt_num_q,
+            num_blocks=eomt_num_blocks
+    )
+
+        _load_network_weights_from_lightning_ckpt(network, ckpt, device)
         
+        model = EoMTSemanticWrapper(network, img_size=(H, W)).to(device).eval()
 
         # evaluate seg + efficiency
         evaluator = Evaluator(
@@ -120,7 +162,6 @@ def main():
         out = {
             "experiment_id": exp_dir.name,
             "dataset": args.dataset,
-            "decoder": decoder,
             "vit_name": vit_name,
             "image_size": list(image_size),
             "mean_dice": seg["mean_dice"],

@@ -1,25 +1,27 @@
 experiment_id: auto
 dataset: endoscopy
 
-vit_name: "facebook/dinov3-vitl16-pretrain-lvd1689m" #vit_small_patch14_dinov2.lvd142m #"facebook/dinov3-vits16-pretrain-lvd1689m" 
-decoder: masktfm
-image_size: auto
+vit_name: facebook/dinov3-vitl16-pretrain-lvd1689m
+image_size: [480, 480]
 
 # optimization
-lr: 0.0001
-llrd: 0.90
-lr_multi: 1.5
-poly_power: 0.95
+lr: 0.0002
+llrd: 1.0
+lr_multi: 0.1
+poly_power: 0.9
 weight_decay: 0.05
-epochs: 75
+epochs: 50
 batch_size: 4
-num_workers: 4
+num_workers: 9
 freeze_encoder: False
 unfreeze_last_k: 0
-
-
 non_vit_warmup: 0.05
 vit_warmup: 0.15
+
+# eomt specific
+eomt_num_q: 6
+eomt_num_blocks: 4
+eomt_masked_attn_enabled: True
 
 # training setup
 train_tf_kind: aug

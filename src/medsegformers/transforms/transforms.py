@@ -71,19 +71,10 @@ def get_transforms(dataset: str, kind="basic", image_size=None):
     if kind in ("basic", "aug"):
         tfs += [ScaleIntensityd(keys="image")]
 
-    if image_size:
-        tfs += [
-            Resized(
-                keys=keys_imglab,
-                spatial_size=image_size,
-                mode=("bilinear", "nearest"),
-            ),
-        ]
-
     if kind == "aug":
         tfs += [
             RandFlipd(keys=keys_imglab, prob=0.5, spatial_axis=1),
-            RandRotate90d(keys=keys_imglab, prob=0.5, max_k=3),
+            # RandRotate90d(keys=keys_imglab, prob=0.5, max_k=3),
             RandAffined(
                 keys=keys_imglab,
                 prob=0.5,
@@ -91,6 +82,15 @@ def get_transforms(dataset: str, kind="basic", image_size=None):
                 scale_range=(0.1, 0.1, 0.0),
                 mode=("bilinear", "nearest"),
                 padding_mode="zeros",
+            ),
+        ]
+    
+    if image_size:
+        tfs += [
+            Resized(
+                keys=keys_imglab,
+                spatial_size=image_size,
+                mode=("bilinear", "nearest"),
             ),
         ]
 

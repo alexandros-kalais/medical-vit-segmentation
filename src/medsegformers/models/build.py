@@ -13,7 +13,7 @@ def build_segmentation_model(
     freeze_encoder: bool = True,
     unfreeze_last_k: int = 0,
     decoder_kwargs: Optional[dict] = None,
-    indices: Tuple[int, ...] = (1, 4, 7, 12),
+    indices: Tuple[int, ...] = (5, 11, 17, 23),
     image_size: Tuple[int, int] = (224, 224),
 ) -> nn.Module:
     

@@ -1,63 +1,21 @@
 import math
-import os
+import os, sys, json
 from typing import Iterable, List, Tuple
 import torch.nn as nn 
 import lightning as L
 import torch
 from monai.data import DataLoader
 from torch.utils.data import Subset
-from collections import Counter
-from medsegformers.config.args import get_train_args_parser
+from lightning.pytorch.loggers import WandbLogger
 from medsegformers.data import get_dataset_class
 from medsegformers.transforms import get_transforms
-from medsegformers.utils.paths import get_data_root
-
+from medsegformers.utils.paths import get_data_root, ckpt_dir
 from medsegformers.models.eomt import EoMT
 from medsegformers.models import ViT
-from medsegformers.engines.eomt.mask_classification_semantic import (
-    MaskClassificationSemantic,
-)
-
-from lightning.pytorch.loggers import WandbLogger
-
-def scan_class_coverage(dataset, num_classes: int, max_items: int | None = None):
-    """
-    Iterates the dataset (which yields (image, target) where target['labels'] are class ids)
-    and returns:
-      - present_class_ids: sorted list of class ids that appear at least once
-      - per_class_image_count: dict[class_id] -> number of images where the class appears
-      - per_class_pixel_count: dict[class_id] -> total pixel count across the split
-    """
-    per_class_image_count = Counter()
-    per_class_pixel_count = Counter()
-    present = set()
-
-    length = len(dataset) if max_items is None else min(max_items, len(dataset))
-    for i in range(length):
-        _, tgt = dataset[i]  # tgt: {"masks": [N,H,W] bool or 0-sized, "labels": [N], "is_crowd": [N]}
-        labels = tgt["labels"].cpu().numpy().tolist()
-        if len(labels) == 0:
-            continue
-
-        # Image-level presence
-        seen_in_image = set(labels)
-        for c in seen_in_image:
-            per_class_image_count[c] += 1
-            present.add(c)
-
-        # Pixel-level presence (optional but useful)
-        masks = tgt["masks"]   # shape [N,H,W] (bool) or empty
-        if masks.numel() > 0:
-            for k, c in enumerate(labels):
-                per_class_pixel_count[c] += int(masks[k].sum().item())
-
-    present_class_ids = sorted(list(present))
-    # Ensure all classes are represented in the dicts (with 0 if missing)
-    for c in range(num_classes):
-        per_class_image_count.setdefault(c, 0)
-        per_class_pixel_count.setdefault(c, 0)
-
-    return present_class_ids, dict(per_class_image_count), dict(per_class_pixel_count)
+from medsegformers.cli.config import load_config
+from medsegformers.engines.eomt.mask_classification_semantic import MaskClassificationSemantic
+from datetime import datetime
+from lightning.pytorch.callbacks import ModelCheckpoint
 
 def eomt_train_collate(batch):
     images, targets = [], []
@@ -72,72 +30,86 @@ def eomt_eval_collate(batch):
     return tuple(zip(*batch))
 
 
-def lightning_optimizer_steps_per_epoch(trainer: L.Trainer, train_loader_len: int) -> int:
-    ltb = trainer.limit_train_batches
-    if isinstance(ltb, int):
-        effective_batches = min(train_loader_len, ltb)
-    elif isinstance(ltb, float):
-        effective_batches = int(math.floor(train_loader_len * ltb))
-    else:
-        effective_batches = train_loader_len
-    accum = getattr(trainer, "accumulate_grad_batches", 1)
-    return max(1, math.ceil(effective_batches / accum))
+def compute_mask_anneal_windows(
+    total_steps: int,
+    num_blocks: int,
+    a_start_frac: float = 0.10,   
+    a_end_frac: float   = 0.60,   
+    block_span_ratio: float = 0.50  
+) -> Tuple[List[int], List[int]]:
 
-def set_default(ns, name, value):
-    if not hasattr(ns, name):
-        setattr(ns, name, value)
-
-
-def scale_milestones(total_steps: int, fractions: List[float]) -> List[int]:
-    return [max(0, int(round(total_steps * f))) for f in fractions]
-
-
-def default_mask_anneal_fracs(n_blocks: int) -> Tuple[List[float], List[float]]:
-
-    if n_blocks <= 0:
+    if num_blocks <= 0 or total_steps <= 1:
         return [], []
-    starts = [i * (0.80 / max(1, n_blocks - 1)) for i in range(n_blocks)]  # [0 .. 0.8]
-    ends = [min(s + 0.18, 0.60) for s in starts]
-    ends[-1] = 0.60
-    return starts, ends
 
+   
+    A_start = max(0, min(total_steps - 2, int(total_steps * a_start_frac)))
+    A_end   = max(A_start + 1, min(total_steps - 1, int(total_steps * a_end_frac)))
+    A_span  = max(2, A_end - A_start)
 
-# ======================= main =======================
+    
+    block_dur = max(1, int(A_span * block_span_ratio))
+    block_dur = min(block_dur, A_span - 1)  
+
+    if num_blocks == 1:
+        return [A_start], [A_end]
+
+    stride = max(1, (A_span - block_dur) // (num_blocks - 1))
+
+    starts_steps: List[int] = []
+    ends_steps:   List[int] = []
+
+    for b in range(num_blocks):
+        s = A_start + b * stride
+        e = s + block_dur
+
+        e = min(e, A_end)
+
+        if b == num_blocks - 1:
+            e = A_end
+            s = min(s, e - 1)
+
+        s = max(0, min(s, total_steps - 2))
+        e = max(s + 1, min(e, total_steps - 1))
+
+        starts_steps.append(s)
+        ends_steps.append(e)
+
+    return starts_steps, ends_steps
 
 def main():
-    args = get_train_args_parser().parse_args()
 
-    # # ---------- sensible defaults (only if not already in your args) ----------
-    # set_default(args, "vit_ckpt", None)
-    set_default(args, "eomt_num_q", 7)          # capacity for semantic queries
-    set_default(args, "eomt_num_blocks", 4)
-    set_default(args, "eomt_disable_masked_attn", False)
-    set_default(args, "ignore_index", 255)
-    set_default(args, "freeze_encoder", True)
-    set_default(args, "unfreeze_last_k", 0)        # try 2/4 on small data
-    # set_default(args, "num_workers", 0)
-    # set_default(args, "seed", 41)
+    # 1. Load experiment config
+    cfg_path = None
+    for arg in sys.argv:
+        if arg.endswith("yml") or arg.endswith(".yaml"):
+            cfg_path = arg
+            break
+    if cfg_path is None:
+        raise ValueError("Plese provide a config YAML path")
 
-    # ---------- runtime ----------
+    args = load_config(cfg_path)
+
+    # 2. Runtime setup
+    L.seed_everything(args.seed, workers=True)
     use_gpu = torch.cuda.is_available()
     accelerator = "gpu" if use_gpu else "cpu"
     devices = 1
     precision = "16-mixed" if use_gpu else "32-true"
-    num_workers = int(getattr(args, "num_workers", 0))
-    pin_memory = use_gpu
-    persistent_workers = bool(num_workers > 0)
 
-    L.seed_everything(args.seed, workers=True)
-
-    # ------------------------- datasets & transforms -------------------------
+    # 3. Transforms and Data
     DatasetCls = get_dataset_class(args.dataset)
     root = DatasetCls.default_root(get_data_root())
 
-    train_tf = get_transforms(dataset=args.dataset, kind=args.train_tf_kind, image_size=args.image_size)
-    val_tf   = get_transforms(dataset=args.dataset, kind=args.val_tf_kind,  image_size=args.image_size)
+    args.image_size = DatasetCls.get_image_size(
+    vit_name=args.vit_name,
+    user_size=getattr(args, "image_size", None)
+    )
 
-    train_ds = DatasetCls(split = "train",      transform=train_tf, root=root, seed=args.seed, return_masks = True)
-    val_ds   = DatasetCls(split = "validation", transform=val_tf,   root=root, seed=args.seed, return_masks = True)
+    tf_train = get_transforms(dataset=args.dataset, kind=args.train_tf_kind, image_size=args.image_size)
+    tf_val   = get_transforms(dataset=args.dataset, kind=args.val_tf_kind,   image_size=args.image_size)
+
+    train_ds = DatasetCls(split="train",      transform=tf_train, root=root, seed=args.seed, return_masks=True)
+    val_ds   = DatasetCls(split="validation", transform=tf_val,   root=root, seed=args.seed, return_masks=True)
 
     num_classes = getattr(DatasetCls, "NUM_CLASSES", None)
 
@@ -148,71 +120,28 @@ def main():
         train_ds = torch.utils.data.Subset(train_ds, list(range(args.subset)))
         val_ds   = torch.utils.data.Subset(val_ds,   list(range(args.subset)))
 
-
     train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        collate_fn=eomt_train_collate,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-        drop_last=False,
+        train_ds, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=use_gpu, collate_fn=eomt_train_collate,
     )
-
     val_loader = DataLoader(
-        val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=eomt_eval_collate,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-        drop_last=False,
+        val_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=use_gpu, collate_fn=eomt_eval_collate
     )
 
-    # ------------------------- logging + trainer -------------------------
-    wandb_logger = WandbLogger(
-        project=getattr(args, "wandb_project", "Internship-medical-vit-segmentation"),
-        name=args.experiment_id,
-        log_model=False,
-    )
+    # 4. Model and Module 
 
-    trainer = L.Trainer(
-        accelerator=accelerator,
-        devices=devices,
-        max_epochs=args.epochs,
-        precision=precision,
-        log_every_n_steps=10,
-        num_sanity_val_steps=0,
-        detect_anomaly=False,
-        logger=wandb_logger,
-    )
-
-    # ------------------------- steps & annealing (ratio-scaled) -------------------------
-    steps_per_epoch = lightning_optimizer_steps_per_epoch(trainer, len(train_loader))
-    total_steps = steps_per_epoch * trainer.max_epochs
-
-    # Default fractions (fast debug): fully off by ~60% of training
-    starts_frac, ends_frac = default_mask_anneal_fracs(getattr(args, "eomt_num_blocks", 4))
-    # If you want the official-ish schedule instead, uncomment:
-    # starts_frac = [0.00, 0.40, 0.60, 0.80]
-    # ends_frac   = [0.10, 0.35, 0.50, 0.60]  # or [0.18, 0.60, 0.80, 1.00]
-
-    anneal_starts = scale_milestones(total_steps, starts_frac)
-    anneal_ends = scale_milestones(total_steps, ends_frac)
-    warm_steps = scale_milestones(total_steps, [0.08, 0.15])
-
-    print(f"steps_per_epoch={steps_per_epoch}, total_steps={total_steps}")
-    print("anneal_starts:", anneal_starts)
-    print("anneal_ends  :", anneal_ends)
-    print("warmup_steps :", warm_steps)
-
-    # ------------------------- ViT -> EoMT -------------------------
     H, W = args.image_size
+    if any(x in args.vit_name.lower() for x in ["16-", "16_"]):
+        patch_size = 16
+    elif any(x in args.vit_name.lower() for x in ["14_"]):
+        patch_size = 14
+    else:
+        raise ValueError("Define patch_size correctly!")
+
     encoder = ViT(
         img_size=(H, W),
-        patch_size=16,
+        patch_size=patch_size,
         backbone_name=args.vit_name,
         ckpt_path=getattr(args, "vit_ckpt", None),
     )
@@ -230,28 +159,106 @@ def main():
     network = EoMT(
         encoder=encoder,
         num_classes=num_classes,
-        num_q=getattr(args, "eomt_num_q", 100),
-        num_blocks=getattr(args, "eomt_num_blocks", 4),
-        masked_attn_enabled=not bool(getattr(args, "eomt_disable_masked_attn", False)),
+        num_q=args.eomt_num_q,
+        num_blocks=args.eomt_num_blocks,
+        masked_attn_enabled=bool(args.eomt_masked_attn_enabled),
     )
 
+    steps_per_epoch = len(train_loader)
+    total_steps = steps_per_epoch * args.epochs
 
-    # ------------------------- Lightning module -------------------------
+    non_vit_warmup = int(total_steps * args.non_vit_warmup)
+    vit_warmup = int(total_steps * args.vit_warmup)       
+    warmup_steps = (non_vit_warmup, vit_warmup)
+
+
+    anneal_starts, anneal_ends = compute_mask_anneal_windows(
+        total_steps=total_steps,
+        num_blocks=args.eomt_num_blocks,
+        a_start_frac=0.10,
+        a_end_frac=0.60,
+        block_span_ratio=0.50
+    )
+
+    print(f"[INFO] steps_per_epoch={steps_per_epoch}, total_steps={total_steps}")
+    print("[INFO] anneal_starts:", anneal_starts)
+    print("[INFO] anneal_ends  :", anneal_ends)
+    print("[INFO] warmup_steps :", warmup_steps)
+
+
     module = MaskClassificationSemantic(
         network=network,
         img_size=(H, W),
         num_classes=num_classes,
-        attn_mask_annealing_enabled=not bool(getattr(args, "eomt_disable_masked_attn", False)),
+        attn_mask_annealing_enabled=bool(args.eomt_masked_attn_enabled),
         lr=args.lr,
-        llrd=getattr(args, "llrd", 1.0),
-        lr_mult=getattr(args, "lr_mult", 1.0),
-        warmup_steps=warm_steps,
-        ignore_idx=getattr(args, "ignore_index", 255),
+        llrd=args.llrd,
+        lr_mult=args.lr_multi,
+        warmup_steps=warmup_steps,
         attn_mask_annealing_start_steps=anneal_starts,
         attn_mask_annealing_end_steps=anneal_ends,
     )
 
-    # ------------------------- train -------------------------
+    if not hasattr(args, "experiment_id") or args.experiment_id in [None, "", "auto"]:
+        timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+        vit_name_lower = args.vit_name.lower()
+        if "dinov3" in vit_name_lower:
+            vit_short = "dinov3"
+        elif "dinov2" in vit_name_lower:
+            vit_short = "dinov2"
+        args.experiment_id = f"eomt_{vit_short}_{args.image_size[0]}_{args.image_size[1]}_lr{args.lr}_bs{args.batch_size}_{timestamp}"
+        print(f"[INFO] Auto experiment_id set to: {args.experiment_id}")
+
+
+    # 5. Logging and checkpoints
+    wandb_logger = WandbLogger(
+        project="Internship-medical-vit-segmentation",
+        name=args.experiment_id,
+        log_model=False,
+    )
+
+    wandb_logger.experiment.config.update(vars(args))
+
+    run_dir = ckpt_dir(args.dataset, args.experiment_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    
+    ckpt_callback = ModelCheckpoint(
+    dirpath=str(run_dir),
+    filename="epoch={epoch:03d}-miou={val_iou_all:.3f}",
+    monitor="metrics/val_iou_all",
+    mode="max",
+    save_top_k=1,
+    save_last=True,
+)
+    run_config = vars(args).copy()
+    run_config.update({
+    "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "steps_per_epoch": steps_per_epoch,
+    "total_steps": total_steps,
+    "warmup_steps": {
+        "non_vit_warmup": non_vit_warmup,
+        "vit_warmup": vit_warmup
+        },
+    "anneal_starts": anneal_starts,
+    "anneal_ends": anneal_ends
+    })
+
+    with open(run_dir / "run_config.json", "w") as f:
+        json.dump(run_config, f, indent=4)
+
+
+    trainer = L.Trainer(
+        accelerator=accelerator,
+        devices=devices,
+        max_epochs=args.epochs,
+        precision=precision,
+        log_every_n_steps=10,
+        num_sanity_val_steps=0,
+        detect_anomaly=False,
+        logger=wandb_logger,
+        callbacks=[ckpt_callback],
+    )
+
     trainer.fit(module, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
     try:

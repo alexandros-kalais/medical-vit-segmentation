@@ -38,6 +38,11 @@ def main():
     DatasetCls = get_dataset_class(args.dataset)
     root = DatasetCls.default_root(get_data_root())
 
+    args.image_size = DatasetCls.get_image_size(
+    vit_name=args.vit_name,
+    user_size=getattr(args, "image_size", None)
+    )
+
     # 3. Transforms and Data
     tf_train = get_transforms(dataset=args.dataset, kind=args.train_tf_kind, image_size=args.image_size)
     tf_val   = get_transforms(dataset=args.dataset, kind=args.val_tf_kind,   image_size=args.image_size)
@@ -78,8 +83,8 @@ def main():
     steps_per_epoch = len(train_loader)
     total_steps = steps_per_epoch * args.epochs
 
-    non_vit_warmup = int(total_steps * 0.05)
-    vit_warmup = int(total_steps * 0.15)       
+    non_vit_warmup = int(total_steps * args.non_vit_warmup)
+    vit_warmup = int(total_steps * args.vit_warmup)       
     warmup_steps = (non_vit_warmup, vit_warmup)
 
     print(f"[INFO] steps_per_epoch={steps_per_epoch}, total_steps={total_steps}")
@@ -106,7 +111,7 @@ def main():
         elif "dinov2" in vit_name_lower:
             vit_short = "dinov2"
         decoder_short = args.decoder
-        args.experiment_id = f"{decoder_short}_{vit_short}_{args.image_size[0]}_{args.image_size[0]}_lr{args.lr}_bs{args.batch_size}_{timestamp}"
+        args.experiment_id = f"{decoder_short}_{vit_short}_{args.image_size[0]}_{args.image_size[1]}_lr{args.lr}_bs{args.batch_size}_{timestamp}"
         print(f"[INFO] Auto experiment_id set to: {args.experiment_id}")
 
 
