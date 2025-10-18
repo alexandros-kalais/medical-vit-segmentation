@@ -7,14 +7,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torchvision.utils import make_grid
+from torchmetrics.classification import MulticlassJaccardIndex
 from monai.data import decollate_batch
-from monai.metrics import DiceMetric, MeanIoU
+
 from monai.transforms import Compose, Activations, AsDiscrete
 
 from medsegformers.utils.vis import colorize_index_map, to_np_uint8
 from medsegformers.losses.dicece import FlexDiceCELoss
 from medsegformers.engines.eomt.two_stage_warmup_poly_schedule import TwoStageWarmupPolySchedule
 
+IGNORE_INDEX = 255
 
 class EncoderDecoderSegModule(L.LightningModule):
 
@@ -47,16 +49,8 @@ class EncoderDecoderSegModule(L.LightningModule):
 
         self.criterion = FlexDiceCELoss(num_classes=num_classes) 
 
-        if num_classes == 1:
-            self.post_pred = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
-            self.post_label = None
-        else:
-            self.post_pred = Compose([Activations(softmax=True), AsDiscrete(argmax=True, to_onehot=num_classes)])
-            self.post_label = Compose([AsDiscrete(to_onehot=num_classes)])
-
-        self.dice_metric = DiceMetric(include_background=False, reduction="mean")
-        self.iou_metric = MeanIoU(include_background=False, reduction="mean")
-
+        self.iou_macro = MulticlassJaccardIndex(num_classes=num_classes, ignore_index=IGNORE_INDEX, average=None, validate_args=False
+)
 
     def configure_optimizers(self):
         enc_backbone = self.network.encoder.encoder.backbone
@@ -130,15 +124,8 @@ class EncoderDecoderSegModule(L.LightningModule):
         logits = self(images)
         loss = self.criterion(logits, labels)
 
-        y_pred = [self.post_pred(x) for x in decollate_batch(logits)]
-        if self.num_classes == 1:
-            y_true = decollate_batch(labels)
-        else:
-            y_true = [self.post_label(x) for x in decollate_batch(labels)]
-
-        self.dice_metric(y_pred=y_pred, y=y_true)
-        self.iou_metric(y_pred=y_pred, y=y_true)
-
+        preds = logits.argmax(dim=1)
+        self.iou_macro.update(preds, labels.squeeze(1))
         if self.log_images and batch_idx == 0 and hasattr(self.logger, "experiment"):
             self._log_wandb_images(images, labels, logits)
 
@@ -146,33 +133,33 @@ class EncoderDecoderSegModule(L.LightningModule):
         return loss
 
     def on_validation_epoch_end(self):
-        dice = self.dice_metric.aggregate().item()
-        miou = self.iou_metric.aggregate().item()
-        self.dice_metric.reset()
-        self.iou_metric.reset()
-        self.log("dice_score", dice, prog_bar=True, sync_dist=False)
-        self.log("mean_iou", miou, prog_bar=True, sync_dist=False)
+        # per-class
+        per_class = self.iou_macro.compute()  # tensor [C]
+        for c, v in enumerate(per_class):
+            self.log(f"metrics/val_iou_class_{c}", float(v), prog_bar=False, sync_dist=False)
+        
+
+        # compute macro mean mIoU manually
+        mean_iou = float(per_class.mean())
+        self.log("metrics/val_iou_all", mean_iou, prog_bar=True, sync_dist=False)
+        self.iou_macro.reset()
 
     def _log_wandb_images(self, images: torch.Tensor, labels: torch.Tensor, logits: torch.Tensor):
 
-        if self.num_classes == 1:
-            preds = (logits.sigmoid() > 0.5).float()
-            images_grid = make_grid(images, nrow=2, normalize=True, scale_each=True)
-            preds_grid  = make_grid(preds,  nrow=2, normalize=True, scale_each=True)
-            labels_grid = make_grid(labels.float(), nrow=2, normalize=True, scale_each=True)
-            self.logger.experiment.log({
-                "val_images/original":   wandb.Image(images_grid.permute(1,2,0).cpu().numpy()),
-                "val_images/prediction": wandb.Image(preds_grid.permute(1,2,0).cpu().numpy()),
-                "val_images/label":      wandb.Image(labels_grid.permute(1,2,0).cpu().numpy()),
-            }, commit=False)
-        else:
-            preds_idx = logits.softmax(1).argmax(1)       
-            pred_rgb  = colorize_index_map(preds_idx)    
-            lab_rgb   = colorize_index_map(labels.squeeze(1).long())
+            preds_idx = logits.softmax(1).argmax(1)           # (B,H,W) in {0..5}
+            lab_idx   = labels.squeeze(1).long()              # (B,H,W) in {0..5, 255}
+
+            # Mask predictions wherever labels are IGNORE so those pixels render black
+            ignore_mask = (lab_idx == IGNORE_INDEX)
+            preds_idx_vis = preds_idx.clone()
+            preds_idx_vis[ignore_mask] = IGNORE_INDEX         # <- will render black in colorizer
+
+            pred_rgb = colorize_index_map(preds_idx_vis, self.num_classes)      # handles 255 -> black
+            lab_rgb  = colorize_index_map(lab_idx, self.num_classes)
 
             pred_grid_u8 = make_grid(pred_rgb, nrow=2, normalize=False, pad_value=255)
             lab_grid_u8  = make_grid(lab_rgb,  nrow=2, normalize=False, pad_value=255)
-            img_grid     = make_grid(images,    nrow=2, normalize=True, scale_each=True, pad_value=1.0)
+            img_grid     = make_grid(images,   nrow=2, normalize=True, scale_each=True, pad_value=1.0)
 
             self.logger.experiment.log({
                 "val_images/original":   wandb.Image(img_grid.permute(1,2,0).cpu().numpy()),

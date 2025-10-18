@@ -115,6 +115,9 @@ def main():
 
     if num_classes is None:
         raise ValueError("Dataset class must define NUM_CLASSES")
+
+    if num_classes == 2:
+        num_classes = num_classes - 1
     
     if args.subset > 0:
         train_ds = torch.utils.data.Subset(train_ds, list(range(args.subset)))
@@ -167,18 +170,14 @@ def main():
     steps_per_epoch = len(train_loader)
     total_steps = steps_per_epoch * args.epochs
 
-    non_vit_warmup = int(total_steps * args.non_vit_warmup)
-    vit_warmup = int(total_steps * args.vit_warmup)       
+    non_vit_warmup = steps_per_epoch * 1
+    vit_warmup = steps_per_epoch * 2       
     warmup_steps = (non_vit_warmup, vit_warmup)
 
 
-    anneal_starts, anneal_ends = compute_mask_anneal_windows(
-        total_steps=total_steps,
-        num_blocks=args.eomt_num_blocks,
-        a_start_frac=0.10,
-        a_end_frac=0.60,
-        block_span_ratio=0.50
-    )
+    anneal_starts = [2*steps_per_epoch, 4*steps_per_epoch, 6*steps_per_epoch, 8*steps_per_epoch]
+    anneal_ends = [4*steps_per_epoch, 6*steps_per_epoch, 8*steps_per_epoch, 10*steps_per_epoch]
+
 
     print(f"[INFO] steps_per_epoch={steps_per_epoch}, total_steps={total_steps}")
     print("[INFO] anneal_starts:", anneal_starts)
@@ -206,6 +205,10 @@ def main():
             vit_short = "dinov3"
         elif "dinov2" in vit_name_lower:
             vit_short = "dinov2"
+        elif "dino" in vit_name_lower:
+            vit_short = "dino"
+        else:
+            vit_short = "ImageNet"
         args.experiment_id = f"eomt_{vit_short}_{args.image_size[0]}_{args.image_size[1]}_lr{args.lr}_bs{args.batch_size}_{timestamp}"
         print(f"[INFO] Auto experiment_id set to: {args.experiment_id}")
 
@@ -228,7 +231,7 @@ def main():
     monitor="metrics/val_iou_all",
     mode="max",
     save_top_k=1,
-    save_last=True,
+    save_last=False,
 )
     run_config = vars(args).copy()
     run_config.update({

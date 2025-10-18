@@ -5,25 +5,23 @@ from monai.transforms import (
 import numpy as np
 import torch
 
+IGNORE_INDEX = 255
+
 def binary_mask_preprocess(x: np.ndarray):
-    """
-    Input x can be (H,W) or (C,H,W). Ensure single channel and binarize.
-    Returns float32 {0,1} as [1,H,W].
-    """
+
     if x.ndim == 2:
         x = x[None, ...]
     if x.shape[0] > 1: 
         x = x[:1, ...]
-    return (x > 0).astype(np.float32)
+    return (x > 0).astype(np.int64)
 
-PALETTE = np.array([
-    [  0,   0,   0],  # 0 background
-    [255,   0,   0],  # 1 cystic plate
-    [  0, 255,   0],  # 2 Calot triangle
-    [  0,   0, 255],  # 3 cystic artery
-    [255, 255,   0],  # 4 cystic duct
-    [255,   0, 255],  # 5 gallbladder
-    [  0, 255, 255],  # 6 tools
+PALETTE_NO_BG = np.array([
+    [255,   0,   0],  # 0 cystic plate
+    [  0, 255,   0],  # 1 Calot triangle
+    [  0,   0, 255],  # 2 cystic artery
+    [255, 255,   0],  # 3 cystic duct
+    [255,   0, 255],  # 4 gallbladder
+    [  0, 255, 255],  # 5 tools
 ], dtype=np.uint8)
 
 def mask_to_indices_endoscopy(x: np.ndarray) -> np.ndarray:
@@ -32,14 +30,10 @@ def mask_to_indices_endoscopy(x: np.ndarray) -> np.ndarray:
         x = x[None, ...]
     c, h, w = x.shape
 
-    if c == 1:
-        y = x.astype(np.int64)
-        return y 
-
     if c == 3:
         rgb = np.moveaxis(x, 0, -1).astype(np.uint8)
-        y = np.zeros((h, w), dtype=np.int64)
-        for idx, color in enumerate(PALETTE):
+        y = np.full((h, w), IGNORE_INDEX, dtype=np.int64)
+        for idx, color in enumerate(PALETTE_NO_BG):
             matches = np.all(rgb == color, axis=-1)
             y[matches] = idx
         return y[None, :]

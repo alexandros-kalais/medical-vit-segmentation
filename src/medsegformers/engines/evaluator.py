@@ -1,15 +1,18 @@
 import numpy as np
 import torch
 from typing import Dict, Tuple, Optional
+from torchmetrics.classification import MulticlassJaccardIndex
 from monai.data import decollate_batch
-from monai.transforms import Compose, Activations, AsDiscrete
-from monai.metrics import DiceMetric, MeanIoU, HausdorffDistanceMetric
+from monai.metrics import HausdorffDistanceMetric
 from medsegformers.utils.vis import ENDOSCOPY_CLASS_NAMES
 
 import copy, time
 import numpy as np
 import torch
 from fvcore.nn import FlopCountAnalysis
+
+
+IGNORE_INDEX = 255
 
 def _count_params_total(model: torch.nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
@@ -65,26 +68,19 @@ class Evaluator:
         self.num_classes = num_classes
         self.device = device
 
-        if num_classes == 1:
-            self.post_pred_dice = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
-            self.post_pred_iou  = self.post_pred_dice
-            self.post_label_iou = Compose([AsDiscrete(to_onehot=2)])
-            self.post_label     = None
-        else:
-            self.post_pred_dice = Compose([Activations(softmax=True), AsDiscrete(argmax=True, to_onehot=num_classes)])
-            self.post_pred_iou  = self.post_pred_dice
-            self.post_label     = Compose([AsDiscrete(to_onehot=num_classes)])
-            self.post_label_iou = self.post_label
+        self.iou_per_class = MulticlassJaccardIndex(
+            num_classes=num_classes,
+            ignore_index=IGNORE_INDEX,
+            average=None,
+            validate_args=False
+        ).to(self.device)
 
-        red = "none"
-        self.dice_metric = DiceMetric(include_background=include_background, reduction=red)
-        self.miou_metric = MeanIoU   (include_background=include_background, reduction=red)
         self.compute_hd95 = compute_hd95
         self.hd95_metric = None
         if compute_hd95:
             self.hd95_metric = HausdorffDistanceMetric(
                 include_background=include_background,
-                percentile=95.0, directed=False, reduction=red
+                percentile=95.0, directed=False, reduction="none"
             )
 
     def efficiency(
@@ -118,55 +114,81 @@ class Evaluator:
     @torch.no_grad()
     def run(self, loader, *, dataset_name: str) -> Dict:
         self.model.eval()
+
+        hd95_class_sums = None  # accumulate per-class sums
+        hd95_class_counts = None
+
         for batch in loader:
-            images, labels = batch["image"].to(self.device), batch["label"].to(self.device)
-            logits = self.model(images)
+            images = batch["image"].to(self.device)
+            labels = batch["label"].to(self.device)          # (B,1,H,W) with {0..C-1, 255}
 
-            if self.num_classes == 1:
-                dice_preds  = [self.post_pred_dice(x) for x in decollate_batch(logits)]
-                dice_labels = decollate_batch(labels)
-            else:
-                dice_preds  = [self.post_pred_dice(x) for x in decollate_batch(logits)]
-                dice_labels = [self.post_label(x)     for x in decollate_batch(labels)]
+            logits = self.model(images)                      # (B,C,H,W)
+            preds  = logits.argmax(dim=1)                    # (B,H,W) in {0..C-1}
+            target = labels.squeeze(1).long()                # (B,H,W) in {0..C-1, 255}
 
-            self.dice_metric(y_pred=dice_preds, y=dice_labels)
 
-            if self.num_classes == 1:
-                iou_preds  = [self.post_pred_iou(x)  for x in decollate_batch(logits)]
-                iou_labels = [self.post_label_iou(x) for x in decollate_batch(labels)]
-            else:
-                iou_preds, iou_labels = dice_preds, dice_labels
+            # IoU (torchmetrics) — ignores 255 automatically
+            self.iou_per_class.update(preds, target)
 
-            self.miou_metric(y_pred=iou_preds, y=iou_labels)
-            if self.hd95_metric:
-                self.hd95_metric(y_pred=iou_preds, y=iou_labels)
+            # HD95 (optional): build one-hot WITH ignored pixels suppressed
+            if self.hd95_metric is not None:
+                # Map ignored labels to class 0 temporarily (to keep shapes), but then zero-out both pred & gt at those positions
+                t_tmp = target.clone()
+                t_tmp[target == IGNORE_INDEX] = 0
 
-        dice_raw = self.dice_metric.aggregate().cpu().numpy()
-        miou_raw = self.miou_metric.aggregate().cpu().numpy()
-        hd95_raw = self.hd95_metric.aggregate().cpu().numpy() if self.hd95_metric else None
+                # discrete preds for HD: if we confidence-masked to 255, also send them to 0 temp, then zero-out with mask
+                p_tmp = preds.clone()
+                p_tmp[p_tmp == IGNORE_INDEX] = 0
 
-        self.dice_metric.reset()
-        self.miou_metric.reset()
-        if self.hd95_metric:
-            self.hd95_metric.reset()
+                # one-hot
+                # Shapes: list of (1,C,H,W) expected by monai metrics if using decollate
+                # We’ll build tensors and decollate explicitly.
+                p_oh = torch.nn.functional.one_hot(p_tmp, num_classes=self.num_classes)  \
+                        .permute(0,3,1,2).float()
+                t_oh = torch.nn.functional.one_hot(t_tmp, num_classes=self.num_classes)  \
+                        .permute(0,3,1,2).float()
 
-        dice_cls = np.nanmean(dice_raw, axis=0) if dice_raw.size else np.array([])
-        miou_cls = np.nanmean(miou_raw, axis=0) if miou_raw.size else np.array([])
-        hd95_cls = np.nanmean(hd95_raw, axis=0) if (hd95_raw is not None and hd95_raw.size) else np.array([])
+                # Zero-out ignored pixels in both p_oh and t_oh
+                ignore = (target == IGNORE_INDEX)            # (B,H,W)
+                p_oh[ignore.unsqueeze(1).expand_as(p_oh)] = 0.0
+                t_oh[ignore.unsqueeze(1).expand_as(t_oh)] = 0.0
 
-        if self.num_classes == 1:
-            class_names = ["foreground"]
+                # decollate to lists for MONAI hd95
+                p_list = list(torch.unbind(p_oh, dim=0))
+                t_list = list(torch.unbind(t_oh, dim=0))
+
+                # compute hd95 per sample (returns tensor [B, C])
+                hd = self.hd95_metric(y_pred=p_list, y=t_list)  # type: ignore
+                # accumulate across batch
+                hd = torch.stack(hd) if isinstance(hd, list) else hd  # (B,C)
+                if hd95_class_sums is None:
+                    hd95_class_sums = torch.zeros(self.num_classes, device=hd.device)
+                    hd95_class_counts = torch.zeros(self.num_classes, device=hd.device)
+                # Only count classes that appear (non-zero gt or pred) to avoid inflating with zeros
+                present = (t_oh.sum(dim=(0,2,3)) > 0)  # which classes present in gt across batch
+                hd95_class_sums[present] += hd[:, present].mean(dim=0)
+                hd95_class_counts[present] += 1
+
+        # Final IoU
+        miou_per_class = self.iou_per_class.compute().cpu().numpy()
+        self.iou_per_class.reset()
+        miou_macro = float(np.nanmean(miou_per_class))   # macro mIoU over 6 classes
+
+        # HD95 aggregate
+        if self.hd95_metric is not None and hd95_class_sums is not None:
+            eps = 1e-9
+            hd95_per_class = (hd95_class_sums / (hd95_class_counts + eps)).cpu().numpy()
+            mean_hd95 = float(np.nanmean(hd95_per_class))
         else:
-            if self.include_background == False:
-                class_names = ENDOSCOPY_CLASS_NAMES[1:]
+            hd95_per_class = [float("nan")] * self.num_classes
+            mean_hd95 = float("nan")
 
+        # We removed Dice as a tracked metric; if you still want it, compute similarly on masked one-hots.
         result = {
-            "class_names": class_names,
-            "dice_per_class": dice_cls.tolist() if dice_cls.size else [],
-            "miou_per_class": miou_cls.tolist() if miou_cls.size else [],
-            "hd95_per_class": hd95_cls.tolist() if hd95_cls.size else [],
-            "mean_dice": float(np.nanmean(dice_cls)) if dice_cls.size else float("nan"),
-            "mean_miou": float(np.nanmean(miou_cls)) if miou_cls.size else float("nan"),
-            "mean_hd95": float(np.nanmean(hd95_cls)) if hd95_cls.size else float("nan"),
+            "miou_per_class": miou_per_class.tolist(),
+            "mean_miou": miou_macro,
+            "hd95_per_class": (hd95_per_class.tolist() if isinstance(hd95_per_class, np.ndarray) else hd95_per_class),
+            "mean_hd95": mean_hd95,
         }
         return result
+
