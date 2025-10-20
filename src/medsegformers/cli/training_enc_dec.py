@@ -57,7 +57,6 @@ def main():
     
     if args.subset > 0:
         train_ds = torch.utils.data.Subset(train_ds, list(range(args.subset)))
-        val_ds   = torch.utils.data.Subset(val_ds,   list(range(args.subset)))
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -83,8 +82,8 @@ def main():
     steps_per_epoch = len(train_loader)
     total_steps = steps_per_epoch * args.epochs
 
-    non_vit_warmup = int(total_steps * args.non_vit_warmup)
-    vit_warmup = int(total_steps * args.vit_warmup)       
+    non_vit_warmup = steps_per_epoch * 1
+    vit_warmup = steps_per_epoch * 2       
     warmup_steps = (non_vit_warmup, vit_warmup)
 
     print(f"[INFO] steps_per_epoch={steps_per_epoch}, total_steps={total_steps}")
@@ -110,6 +109,10 @@ def main():
             vit_short = "dinov3"
         elif "dinov2" in vit_name_lower:
             vit_short = "dinov2"
+        elif "dino" in vit_name_lower:
+            vit_short = "dino"
+        else:
+            vit_short = "ImageNet"
         decoder_short = args.decoder
         args.experiment_id = f"{decoder_short}_{vit_short}_{args.image_size[0]}_{args.image_size[1]}_lr{args.lr}_bs{args.batch_size}_{timestamp}"
         print(f"[INFO] Auto experiment_id set to: {args.experiment_id}")
@@ -130,11 +133,11 @@ def main():
     
     ckpt_callback = ModelCheckpoint(
     dirpath=str(run_dir),
-    filename="{epoch:03d}-{val_loss:.3f}-{mean_iou:.3f}",
-    monitor="mean_iou",
+    filename="{epoch:03d}-{val_loss:.3f}-{miou:.3f}",
+    monitor="metrics/val_iou_all",
     mode="max",
     save_top_k=1,
-    save_last=True,
+    save_last=False,
 )
 
     run_config = vars(args).copy()

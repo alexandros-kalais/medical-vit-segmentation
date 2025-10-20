@@ -25,7 +25,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 from torch.nn.functional import interpolate
 import logging
-
 from medsegformers.engines.eomt.two_stage_warmup_poly_schedule import TwoStageWarmupPolySchedule
 
 bold_green = "\033[1;32m"
@@ -56,7 +55,10 @@ class LightningModule(lightning.LightningModule):
 
         self.network = network
         self.img_size = img_size
-        self.num_classes = num_classes
+        if num_classes == 1:
+            self.num_classes = num_classes + 1
+        else:
+            self.num_classes = num_classes
         self.attn_mask_annealing_enabled = attn_mask_annealing_enabled
         self.attn_mask_annealing_start_steps = attn_mask_annealing_start_steps
         self.attn_mask_annealing_end_steps = attn_mask_annealing_end_steps
@@ -222,23 +224,6 @@ class LightningModule(lightning.LightningModule):
                 for _ in range(num_blocks)
             ])
         
-        # NEW: micro & weighted (FWIoU)
-        self.metrics_micro = nn.ModuleList([
-            MulticlassJaccardIndex(
-                num_classes=self.num_classes,
-                validate_args=False,
-                ignore_index=ignore_idx,
-                average="micro",
-            ) for _ in range(num_blocks)
-        ])
-        self.metrics_weighted = nn.ModuleList([
-            MulticlassJaccardIndex(
-                num_classes=self.num_classes,
-                validate_args=False,
-                ignore_index=ignore_idx,
-                average="weighted",
-            ) for _ in range(num_blocks)
-        ])
 
     @torch.compiler.disable
     def update_metrics_semantic(
@@ -249,10 +234,6 @@ class LightningModule(lightning.LightningModule):
     ):
         for i in range(len(preds)):
             self.metrics[block_idx].update(preds[i][None, ...], targets[i][None, ...])
-            # NEW: micro & weighted
-            self.metrics_micro[block_idx].update(preds[i][None, ...], targets[i][None, ...])
-            self.metrics_weighted[block_idx].update(preds[i][None, ...], targets[i][None, ...])
-
     
 
     def block_postfix(self, block_idx):
@@ -283,31 +264,11 @@ class LightningModule(lightning.LightningModule):
                 iou_all,
             )
 
-            # NEW: micro IoU (global) & weighted IoU (FWIoU)
-            iou_micro = float(self.metrics_micro[i].compute())
-            self.metrics_micro[i].reset()
-            self.log(f"metrics/{log_prefix}_iou_micro{block_postfix}", iou_micro)
-
-            iou_weighted = float(self.metrics_weighted[i].compute())
-            self.metrics_weighted[i].reset()
-            self.log(f"metrics/{log_prefix}_iou_weighted{block_postfix}", iou_weighted)
-
     def _on_eval_end_semantic(self, log_prefix):
         if not self.trainer.sanity_checking:
             cb = self.trainer.callback_metrics
-            # prefer FWIoU for imbalanced datasets
-            try:
-                fw = cb[f"metrics/{log_prefix}_iou_weighted"] * 100
-                ma = cb[f"metrics/{log_prefix}_iou_all"] * 100
-                mi = cb[f"metrics/{log_prefix}_iou_micro"] * 100
-                rank_zero_info(
-                    f"{bold_green}FWIoU: {fw:.1f} | mIoU: {ma:.1f} | microIoU: {mi:.1f}{reset}"
-                )
-            except KeyError:
-
-                rank_zero_info(
-                    f"{bold_green}mIoU: {self.trainer.callback_metrics[f'metrics/{log_prefix}_iou_all'] * 100:.1f}{reset}"
-                )
+            val = cb[f"metrics/{log_prefix}_iou_all"] * 100
+            rank_zero_info(f"{bold_green}mIoU: {val:.1f}{reset}")
 
 
     @torch.compiler.disable
@@ -326,43 +287,45 @@ class LightningModule(lightning.LightningModule):
         axes[0].imshow(img.cpu().numpy().transpose(1, 2, 0))
         axes[0].axis("off")
 
-        target = target.cpu().numpy()
-        unique_classes = np.unique(target)
+        # Make sure we have plain int arrays
+        target_np = target.detach().cpu().numpy().astype(np.int64)       # (H,W) in {0..C-1, 255}
 
-        preds = torch.argmax(logits, dim=0).cpu().numpy()
-        unique_classes = np.unique(np.concatenate((unique_classes, np.unique(preds))))
+        # Raw predictions
+        preds_np = torch.argmax(logits, dim=0).detach().cpu().numpy().astype(np.int64)  # (H,W) in {0..C-1}
+
+        # For *visualization only*, force ignored pixels to be black in the prediction:
+        ignore_mask = (target_np == self.ignore_idx)
+        preds_vis = preds_np.copy()
+        preds_vis[ignore_mask] = self.ignore_idx     # <--- KEY LINE
+
+        # Build the color set over the union of labels & (masked) preds
+        unique_classes = np.unique(
+            np.concatenate((np.unique(target_np), np.unique(preds_vis)))
+        )
 
         num_classes = len(unique_classes)
-        colors = plt.get_cmap(cmap, num_classes)(np.linspace(0, 1, num_classes))  # type: ignore
+        colors = plt.get_cmap(cmap, num_classes)(np.linspace(0, 1, num_classes))  # RGBA
 
-        if self.ignore_idx in unique_classes:
-            colors[unique_classes == self.ignore_idx] = [0, 0, 0, 1]  # type: ignore
+        # Paint the ignore index as black (if present)
+        if (self.ignore_idx in unique_classes):
+            colors[unique_classes == self.ignore_idx] = [0, 0, 0, 1]
 
-        custom_cmap = mcolors.ListedColormap(colors)  # type: ignore
+        custom_cmap = mcolors.ListedColormap(colors)
         norm = mcolors.Normalize(0, num_classes - 1)
 
-        axes[1].imshow(
-            np.digitize(target, unique_classes) - 1,
-            cmap=custom_cmap,
-            norm=norm,
-            interpolation="nearest",
-        )
+        # Map values to [0..num_classes-1] with the same binning for both images
+        target_mapped = np.digitize(target_np, unique_classes) - 1
+        preds_mapped  = np.digitize(preds_vis, unique_classes) - 1
+
+        axes[1].imshow(target_mapped, cmap=custom_cmap, norm=norm, interpolation="nearest")
         axes[1].axis("off")
 
-        if preds is not None:
-            axes[2].imshow(
-                np.digitize(preds, unique_classes, right=True),
-                cmap=custom_cmap,
-                norm=norm,
-                interpolation="nearest",
-            )
-            axes[2].axis("off")
+        axes[2].imshow(preds_mapped, cmap=custom_cmap, norm=norm, interpolation="nearest")
+        axes[2].axis("off")
 
-        patches = [
-            Line2D([0], [0], color=colors[i], lw=4, label=str(unique_classes[i]))
-            for i in range(num_classes)
-        ]
-
+        # Legend labels: show "ignore" instead of 255
+        labels = [("ignore" if cls == self.ignore_idx else str(cls)) for cls in unique_classes]
+        patches = [Line2D([0], [0], color=colors[i], lw=4, label=labels[i]) for i in range(num_classes)]
         fig.legend(handles=patches, loc="upper left")
 
         buf = io.BytesIO()
@@ -447,33 +410,48 @@ class LightningModule(lightning.LightningModule):
             for i, (sums, counts) in enumerate(zip(logit_sums, logit_counts))
         ]
 
-    @staticmethod
-    def to_per_pixel_logits_semantic(
+
+    def to_per_pixel_logits_semantic(self, 
         mask_logits: torch.Tensor, class_logits: torch.Tensor
     ):
-        return torch.einsum(
+        per_pixel_fg = torch.einsum(
             "bqhw, bqc -> bchw",
             mask_logits.sigmoid(),
             class_logits.softmax(dim=-1)[..., :-1],
         )
 
-    @staticmethod
+        if self.num_classes == 2:
+            p_bg = (1.0 - per_pixel_fg.sum(dim=1, keepdim=True)).clamp(0.0, 1.0)
+            per_pixel = torch.cat([p_bg, per_pixel_fg], dim=1)  # (B,2,H,W)
+        else:
+            per_pixel = per_pixel_fg
+        return per_pixel
+
+
     @torch.compiler.disable
-    def to_per_pixel_targets_semantic(
+    def to_per_pixel_targets_semantic(self,
         targets: list[dict],
         ignore_idx,
     ):
         per_pixel_targets = []
         for target in targets:
-            per_pixel_target = torch.full(
+            if self.num_classes == 2:
+                per_pixel_target = torch.zeros(
                 target["masks"].shape[-2:],
-                ignore_idx,
                 dtype=target["labels"].dtype,
-                device=target["labels"].device,
-            )
+                device=target["labels"].device, )
+                for mask in target["masks"]:
+                    per_pixel_target[mask] = 1
+            else:
+                per_pixel_target = torch.full(
+                    target["masks"].shape[-2:],
+                    ignore_idx,
+                    dtype=target["labels"].dtype,
+                    device=target["labels"].device,
+                )
 
-            for i, mask in enumerate(target["masks"]):
-                per_pixel_target[mask] = target["labels"][i]
+                for i, mask in enumerate(target["masks"]):
+                    per_pixel_target[mask] = target["labels"][i]
 
             per_pixel_targets.append(per_pixel_target)
 

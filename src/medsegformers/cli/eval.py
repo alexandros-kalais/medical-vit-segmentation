@@ -105,7 +105,7 @@ def main():
 
         # evaluate seg + efficiency
         evaluator = Evaluator(
-            model, num_classes=num_classes, device=device, include_background=False
+            model, num_classes=num_classes, device=device, include_background=True
         )
         seg = evaluator.run(loader, dataset_name=args.dataset)
         eff = evaluator.efficiency(
@@ -123,11 +123,8 @@ def main():
             "decoder": decoder,
             "vit_name": vit_name,
             "image_size": list(image_size),
-            "mean_dice": seg["mean_dice"],
             "mean_miou": seg["mean_miou"],
             "mean_hd95": seg["mean_hd95"],
-            "class_names": seg["class_names"],
-            "dice_per_class": seg["dice_per_class"],
             "miou_per_class": seg["miou_per_class"],
             "hd95_per_class": seg["hd95_per_class"],
             "total_params": eff["total_params"],
@@ -135,11 +132,12 @@ def main():
             "fps": eff["fps"],
             "ckpt": str(ckpt),
         }
+
         out_json = exp_dir / f"eval.json"
         with open(out_json, "w") as f:
             json.dump(out, f, indent=2)
 
-        print(f"[OK] {exp_dir.name}  mDice={out['mean_dice']:.4f}  mIoU={out['mean_miou']:.4f} mHD95={out['mean_hd95']:.4f}  GFLOPs={out['gflops']:.2f}  FPS={out['fps']:.1f} params={out['total_params']}")
+        print(f"[OK] {exp_dir.name} mIoU={out['mean_miou']:.4f} mHD95={out['mean_hd95']:.4f}  GFLOPs={out['gflops']:.2f}  FPS={out['fps']:.1f} params={out['total_params']}")
 
 if __name__ == "__main__":
     main()
