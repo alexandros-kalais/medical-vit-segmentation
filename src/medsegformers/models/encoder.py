@@ -62,8 +62,7 @@ class Encoder(nn.Module):
                 x = block(x)
 
             if (self.return_intermediate and i in self.indices) or (i == len(self.encoder.backbone.blocks) - 1):
-                if i == len(self.encoder.backbone.blocks) - 1:
-                    x = self.encoder.backbone.norm(x)
+                x = self.encoder.backbone.norm(x)
                 fmap = x[:, self.encoder.backbone.num_prefix_tokens:, :].transpose(1, 2).reshape(
                     x.shape[0], -1, *self.encoder.backbone.patch_embed.grid_size
                 )       

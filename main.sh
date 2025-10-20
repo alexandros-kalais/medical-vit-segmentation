@@ -20,7 +20,8 @@ echo "[INFO] MEDSEG_EXPERIMENTS_ROOT=$MEDSEG_EXPERIMENTS_ROOT"
 echo "[INFO] PYTHONPATH=$PYTHONPATH"
 
 #python3 -m medsegformers.cli.train_eomt configs/eomt.yml
-python3 -m medsegformers.cli.training_enc_dec configs/mla.yml
+# python3 -m medsegformers.cli.training_enc_dec configs/mla.yml
+python3 -m medsegformers.cli.train_mask2former configs/mask2former.yml
 # python3 -m medsegformers.cli.eval \
 # --dataset endoscopy \
 # --experiments_file configs/evaluation.txt
