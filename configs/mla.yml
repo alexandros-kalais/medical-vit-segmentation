@@ -1,9 +1,10 @@
 experiment_id: auto
 dataset: endoscopy
-
+model_type: enc_dec
 vit_name: "vit_base_patch16_224.dino"  #"facebook/dinov3-vits16-pretrain-lvd1689m" 
 decoder: linear
 image_size: [448, 448]
+
 
 # optimization
 lr: 0.0001
@@ -11,15 +12,15 @@ llrd: 0.90
 lr_multi: 1.5
 poly_power: 0.95
 weight_decay: 0.05
-epochs: 70
+epochs: 1
 batch_size: 4
 num_workers: 9
 freeze_encoder: False
 unfreeze_last_k: 0
 
 
-non_vit_warmup: 0.03
-vit_warmup: 0.06
+non_vit_warmup: 1
+vit_warmup: 2
 
 # training setup
 train_tf_kind: aug
@@ -28,3 +29,5 @@ val_tf_kind: basic
 # optional
 seed: 42
 subset: 20
+
+vit_ckpt: null          # or path to weights

@@ -1,7 +1,9 @@
+from typing import Dict, Optional, Tuple, Union, List
 import torch
 import torch.nn as nn
+from .vit import ViT
 import torch.nn.functional as F
-from typing import List, Optional, Union
+from .decoders import build as build_decoder, get_decoder_info
 
 class Encoder(nn.Module):
 
@@ -72,8 +74,44 @@ class Encoder(nn.Module):
             return outputs
         else:
             return outputs[0]
+
+
+class EncDecModel(nn.Module):
+    def __init__(
+        self,
+        vit: ViT,
+        *,
+        num_classes: int,
+        decoder: str,
+        decoder_kwargs: Optional[Dict] = None,
+    ) -> None:
+        super().__init__()
+
+
+        spec = get_decoder_info(decoder)
+
+        if len(vit.backbone.blocks) > 12:
+            indices = (5, 11, 17, 23)
+        else:
+            indices = (1, 4, 7, 11)
+
+        self.encoder = Encoder(
+            encoder=vit,
+            return_intermediate=(spec.input_kind == "multi"),
+            indices=indices,
+        )
         
+        embed_dim = vit.backbone.embed_dim
+        patch_size = vit.backbone.patch_size
 
-            
-  
+        self.decoder = build_decoder(
+            decoder,
+            in_channels=embed_dim,
+            num_classes=num_classes,
+            upsample_factor=patch_size,
+            **(decoder_kwargs or {}),
+        )
 
+    def forward(self, x: torch.Tensor) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        feats = self.encoder(x)
+        return self.decoder(feats)

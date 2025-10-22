@@ -18,11 +18,11 @@ def get_dataset_class(name: str) -> Type[Dataset]:
     return _DATASET_REGISTRY[key]
 
 from .endoscopy import EndoscopyDataset
-from .hyperkvasir import HyperKvasirDataset
+from .transforms import get_transforms
 
 __all__ = [
     "register_dataset",
     "get_dataset_class",
     "EndoscopyDataset",
-    "HyperKvasirDataset",
+    "get_transforms"
 ]

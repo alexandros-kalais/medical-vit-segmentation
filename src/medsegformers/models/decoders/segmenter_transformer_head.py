@@ -59,12 +59,12 @@ class Attention(nn.Module):
             .reshape(B, N, 3, self.heads, C // self.heads)
             .permute(2, 0, 3, 1, 4)
         )
-        q, k, v = qkv[0], qkv[1], qkv[2]               # (B, h, N, d)
-        attn = (q @ k.transpose(-2, -1)) * self.scale  # (B, h, N, N)
+        q, k, v = qkv[0], qkv[1], qkv[2]               
+        attn = (q @ k.transpose(-2, -1)) * self.scale  
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)  # (B, N, C)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)  
         x = self.proj(x)
         x = self.proj_drop(x)
         return x, attn
@@ -133,11 +133,11 @@ class MaskTransformerHead(nn.Module):
 
     def forward(self, feat):
         B, C, Hp, Wp = feat.shape
-        # GS = H // self.upsample_factor
+
         H = Hp * self.upsample_factor
         W = Wp * self.upsample_factor
 
-        x = feat.flatten(2).transpose(1, 2)             # [B, Hp*Wp, C]
+        x = feat.flatten(2).transpose(1, 2)           
         x = self.proj_dec(x)
         cls_emb = self.cls_emb.expand(x.size(0), -1, -1)
         x = torch.cat((x, cls_emb), 1)
@@ -145,7 +145,7 @@ class MaskTransformerHead(nn.Module):
             x = blk(x)
         x = self.decoder_norm(x)
 
-        patches, cls_seg_feat = x[:, : -self.num_classes], x[:, -self.num_classes :] # [B, N, d], [B, num_classes, d]
+        patches, cls_seg_feat = x[:, : -self.num_classes], x[:, -self.num_classes :] 
         patches = patches @ self.proj_patch
         cls_seg_feat = cls_seg_feat @ self.proj_classes
         masks = (patches @ cls_seg_feat.transpose(1, 2)) * self.scale
@@ -160,7 +160,7 @@ class MaskTransformerHead(nn.Module):
                 f"Provided layer_id: {layer_id} is not valid. 0 <= {layer_id} < {self.n_layers}."
             )
         B, C, Hp, Wp = feat.shape
-        x = feat.flatten(2).transpose(1, 2)   # [B, Hp*Wp, C]
+        x = feat.flatten(2).transpose(1, 2)  
         x = self.proj_dec(x)
         cls_emb = self.cls_emb.expand(x.size(0), -1, -1)
         x = torch.cat((x, cls_emb), 1)

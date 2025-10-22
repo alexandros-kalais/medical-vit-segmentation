@@ -2,27 +2,12 @@ from monai.transforms import (
     Compose, LoadImaged, EnsureChannelFirstd, ScaleIntensityd,
     RandFlipd, RandRotate90d, RandAffined, Resized, Lambdad, EnsureTyped
 )
+from medsegformers.utils import COLOR_MAP
 import numpy as np
 import torch
 
 IGNORE_INDEX = 255
-
-def binary_mask_preprocess(x: np.ndarray):
-
-    if x.ndim == 2:
-        x = x[None, ...]
-    if x.shape[0] > 1: 
-        x = x[:1, ...]
-    return (x > 0).astype(np.int64)
-
-PALETTE_NO_BG = np.array([
-    [255,   0,   0],  # 0 cystic plate
-    [  0, 255,   0],  # 1 Calot triangle
-    [  0,   0, 255],  # 2 cystic artery
-    [255, 255,   0],  # 3 cystic duct
-    [255,   0, 255],  # 4 gallbladder
-    [  0, 255, 255],  # 5 tools
-], dtype=np.uint8)
+COLOR_MAP = COLOR_MAP.cpu().numpy().astype(np.uint8)
 
 def mask_to_indices_endoscopy(x: np.ndarray) -> np.ndarray:
 
@@ -33,7 +18,7 @@ def mask_to_indices_endoscopy(x: np.ndarray) -> np.ndarray:
     if c == 3:
         rgb = np.moveaxis(x, 0, -1).astype(np.uint8)
         y = np.full((h, w), IGNORE_INDEX, dtype=np.int64)
-        for idx, color in enumerate(PALETTE_NO_BG):
+        for idx, color in enumerate(COLOR_MAP):
             matches = np.all(rgb == color, axis=-1)
             y[matches] = idx
         return y[None, :]
@@ -42,7 +27,6 @@ def mask_to_indices_endoscopy(x: np.ndarray) -> np.ndarray:
 
 def get_transforms(dataset: str, kind="basic", image_size=None):
     """
-    dataset: "hyperkvasir" (binary) | "endoscopy" (multi-class)
     kind: "none" | "basic" | "aug"
     """
     keys_imglab = ["image", "label"]
@@ -51,16 +35,10 @@ def get_transforms(dataset: str, kind="basic", image_size=None):
         EnsureChannelFirstd(keys=keys_imglab),
     ]
 
-    if dataset == "hyperkvasir":  # binary masks
-        tfs += [
-            Lambdad(keys="label", func=binary_mask_preprocess),
-        ]
-    elif dataset == "endoscopy" or dataset == "endoscopy_eomt":
-        tfs += [
-            Lambdad(keys="label", func=mask_to_indices_endoscopy),
-        ]
-    else:
-        raise ValueError(f"Unknown dataset {dataset}")
+
+    tfs += [
+        Lambdad(keys="label", func=mask_to_indices_endoscopy),
+    ]
 
     if kind in ("basic", "aug"):
         tfs += [ScaleIntensityd(keys="image")]

@@ -1,76 +1,105 @@
-# ---------------------------------------------------------------
-# © 2025 Mobile Perception Systems Lab at TU/e. All rights reserved.
-# Licensed under the MIT License.
-#
-# Portions of this file are adapted from:
-# - the torchmetrics library by the PyTorch Lightning team
-# - the Mask2Former repository by Facebook, Inc. and its affiliates
-# All used under the Apache 2.0 License.
-# ---------------------------------------------------------------
-
 import math
-from typing import Optional, cast
+import io
+import logging
+from typing import List, Optional
 import lightning
 from lightning.fabric.utilities import rank_zero_info
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torchmetrics.classification import MulticlassJaccardIndex
 import wandb
 from PIL import Image
 import matplotlib.colors as mcolors
 from matplotlib.lines import Line2D
-import io
 import matplotlib.pyplot as plt
 import numpy as np
 from torch.nn.functional import interpolate
-import logging
-from medsegformers.engines.eomt.two_stage_warmup_poly_schedule import TwoStageWarmupPolySchedule
+
+from medsegformers.losses.mask_classification_loss import MaskClassificationLoss
+from .two_stage_warmup_poly_schedule import TwoStageWarmupPolySchedule
 
 bold_green = "\033[1;32m"
 reset = "\033[0m"
 
 
-class LightningModule(lightning.LightningModule):
+class MaskClassificationSemantic(lightning.LightningModule):
     def __init__(
         self,
         network: nn.Module,
         img_size: tuple[int, int],
         num_classes: int,
         attn_mask_annealing_enabled: bool,
-        attn_mask_annealing_start_steps: Optional[list[int]],
-        attn_mask_annealing_end_steps: Optional[list[int]],
-        lr: float,
-        llrd: float,
-        llrd_l2_enabled: bool,
-        lr_mult: float,
-        weight_decay: float,
-        poly_power: float,
-        warmup_steps: tuple[int, int],
-        ckpt_path=None,
-        delta_weights=False,
-        load_ckpt_class_head=True,
+        attn_mask_annealing_start_steps: Optional[list[int]] = None,
+        attn_mask_annealing_end_steps: Optional[list[int]] = None,
+        ignore_idx: int = 255,
+        lr: float = 1e-4,
+        llrd: float = 0.8,
+        llrd_l2_enabled: bool = True,
+        lr_mult: float = 1.0,
+        weight_decay: float = 0.05,
+        num_points: int = 12544,
+        oversample_ratio: float = 3.0,
+        importance_sample_ratio: float = 0.75,
+        poly_power: float = 0.9,
+        warmup_steps: List[int] = [500, 1000],
+        no_object_coefficient: float = 0.1,
+        mask_coefficient: float = 5.0,
+        dice_coefficient: float = 5.0,
+        class_coefficient: float = 2.0,
+        mask_thresh: float = 0.8,
+        overlap_thresh: float = 0.8,
+        ckpt_path: Optional[str] = None,
+        delta_weights: bool = False,
+        load_ckpt_class_head: bool = True,
     ):
         super().__init__()
 
         self.network = network
         self.img_size = img_size
-        if num_classes == 1:
-            self.num_classes = num_classes + 1
-        else:
-            self.num_classes = num_classes
+        self.num_classes = num_classes
         self.attn_mask_annealing_enabled = attn_mask_annealing_enabled
         self.attn_mask_annealing_start_steps = attn_mask_annealing_start_steps
         self.attn_mask_annealing_end_steps = attn_mask_annealing_end_steps
+        self.ignore_idx = ignore_idx
+        self.mask_thresh = mask_thresh
+        self.overlap_thresh = overlap_thresh
+        self.stuff_classes = range(num_classes)
         self.lr = lr
         self.llrd = llrd
+        self.llrd_l2_enabled = llrd_l2_enabled
         self.lr_mult = lr_mult
         self.weight_decay = weight_decay
         self.poly_power = poly_power
         self.warmup_steps = warmup_steps
-        self.llrd_l2_enabled = llrd_l2_enabled
+
+        self.save_hyperparameters(ignore=["_class_path"])
 
         self.strict_loading = False
+
+        self.criterion = MaskClassificationLoss(
+            num_points=num_points,
+            oversample_ratio=oversample_ratio,
+            importance_sample_ratio=importance_sample_ratio,
+            mask_coefficient=mask_coefficient,
+            dice_coefficient=dice_coefficient,
+            class_coefficient=class_coefficient,
+            num_labels=num_classes,
+            no_object_coefficient=no_object_coefficient,
+        )
+
+        num_blocks = self.network.num_blocks + 1 if self.network.masked_attn_enabled else 1
+        self.metrics = nn.ModuleList(
+            [
+                MulticlassJaccardIndex(
+                    num_classes=self.num_classes,
+                    validate_args=False,
+                    ignore_index=ignore_idx,
+                    average=None,
+                )
+                for _ in range(num_blocks)
+            ])
 
         if delta_weights and ckpt_path:
             logging.info("Delta weights mode")
@@ -85,7 +114,7 @@ class LightningModule(lightning.LightningModule):
             incompatible_keys = self.load_state_dict(ckpt, strict=False)
             self._raise_on_incompatible(incompatible_keys, load_ckpt_class_head)
 
-        self.log = torch.compiler.disable(self.log)  # type: ignore
+        self.log = torch.compiler.disable(self.log)
 
     def configure_optimizers(self):
         encoder_param_names = {
@@ -169,26 +198,59 @@ class LightningModule(lightning.LightningModule):
                 class_queries_logits=class_logits,
                 targets=targets,
             )
-            block_postfix = self.block_postfix(i)
+            block_postfix = self._block_postfix(i)
             losses = {f"{key}{block_postfix}": value for key, value in losses.items()}
             losses_all_blocks |= losses
 
         return self.criterion.loss_total(losses_all_blocks, self.log)
 
     def validation_step(self, batch, batch_idx=0):
-        return self.eval_step(batch, batch_idx, "val")
+        imgs, targets = batch
 
-    def mask_annealing(self, start_iter, current_iter, final_iter):
-        device = self.device
-        dtype = self.network.attn_mask_probs[0].dtype
-        if current_iter < start_iter:
-            return torch.ones(1, device=device, dtype=dtype)
-        elif current_iter >= final_iter:
-            return torch.zeros(1, device=device, dtype=dtype)
-        else:
-            progress = (current_iter - start_iter) / (final_iter - start_iter)
-            progress = torch.tensor(progress, device=device, dtype=dtype)
-            return (1.0 - progress).pow(self.poly_power)
+        img_sizes = [img.shape[-2:] for img in imgs]
+        crops, origins = self._window_imgs(imgs)
+        mask_logits_per_layer, class_logits_per_layer = self(crops)
+
+        targets = self._to_per_pixel_targets(targets)
+
+        for i, (mask_logits, class_logits) in enumerate(
+            list(zip(mask_logits_per_layer, class_logits_per_layer))
+        ):
+            mask_logits = F.interpolate(mask_logits, self.img_size, mode="bilinear")
+            crop_logits = self._to_per_pixel_logits(mask_logits, class_logits)
+            logits = self._revert_window_logits(crop_logits, origins, img_sizes)
+
+            self._update_metrics(logits, targets, i)
+
+            if batch_idx == 0:
+                self._plot_predictions(
+                    imgs[0], targets[0], logits[0], "val", i, batch_idx
+                )
+
+    def on_validation_epoch_end(self):
+        for i, metric in enumerate(self.metrics):
+            iou_per_class = metric.compute()
+            metric.reset()
+
+            block_postfix = self._block_postfix(i)
+            for class_idx, iou in enumerate(iou_per_class):
+                self.log(
+                    f"metrics/val_iou_class_{class_idx}{block_postfix}",
+                    iou,
+                )
+
+            iou_all = float(iou_per_class.mean())
+            self.log(
+                f"metrics/val_iou_all{block_postfix}",
+                iou_all,
+            )
+        self.log("val_miou", iou_all, on_epoch=True, prog_bar=False, sync_dist=True)
+
+    def on_validation_end(self):
+        if not self.trainer.sanity_checking:
+            cb = self.trainer.callback_metrics
+            val = cb[f"metrics/val_iou_all"] * 100
+            rank_zero_info(f"{bold_green}mIoU: {val:.1f}{reset}")
 
     def on_train_batch_end(
         self,
@@ -199,7 +261,7 @@ class LightningModule(lightning.LightningModule):
     ):
         if self.attn_mask_annealing_enabled:
             for i in range(self.network.num_blocks):
-                self.network.attn_mask_probs[i] = self.mask_annealing(
+                self.network.attn_mask_probs[i] = self._mask_annealing(
                     self.attn_mask_annealing_start_steps[i],
                     self.global_step,
                     self.attn_mask_annealing_end_steps[i],
@@ -212,21 +274,25 @@ class LightningModule(lightning.LightningModule):
                     on_step=True,
                 )
 
-    def init_metrics_semantic(self, ignore_idx, num_blocks):
-        self.metrics = nn.ModuleList(
-            [
-                MulticlassJaccardIndex(
-                    num_classes=self.num_classes,
-                    validate_args=False,
-                    ignore_index=ignore_idx,
-                    average=None,
-                )
-                for _ in range(num_blocks)
-            ])
-        
+    def on_save_checkpoint(self, checkpoint):
+        checkpoint["state_dict"] = {
+            k.replace("._orig_mod", ""): v for k, v in checkpoint["state_dict"].items()
+        }
+
+    def _mask_annealing(self, start_iter, current_iter, final_iter):
+        device = self.device
+        dtype = self.network.attn_mask_probs[0].dtype
+        if current_iter < start_iter:
+            return torch.ones(1, device=device, dtype=dtype)
+        elif current_iter >= final_iter:
+            return torch.zeros(1, device=device, dtype=dtype)
+        else:
+            progress = (current_iter - start_iter) / (final_iter - start_iter)
+            progress = torch.tensor(progress, device=device, dtype=dtype)
+            return (1.0 - progress).pow(self.poly_power)
 
     @torch.compiler.disable
-    def update_metrics_semantic(
+    def _update_metrics(
         self,
         preds: list[torch.Tensor],
         targets: list[torch.Tensor],
@@ -234,9 +300,8 @@ class LightningModule(lightning.LightningModule):
     ):
         for i in range(len(preds)):
             self.metrics[block_idx].update(preds[i][None, ...], targets[i][None, ...])
-    
 
-    def block_postfix(self, block_idx):
+    def _block_postfix(self, block_idx):
         if not self.network.masked_attn_enabled:
             return ""
         return (
@@ -245,34 +310,8 @@ class LightningModule(lightning.LightningModule):
             else ""
         )
 
-    def _on_eval_epoch_end_semantic(self, log_prefix, log_per_class=True):
-        for i, metric in enumerate(self.metrics):  # type: ignore
-            iou_per_class = metric.compute()
-            metric.reset()
-
-            block_postfix = self.block_postfix(i)
-            if log_per_class:
-                for class_idx, iou in enumerate(iou_per_class):
-                    self.log(
-                        f"metrics/{log_prefix}_iou_class_{class_idx}{block_postfix}",
-                        iou,
-                    )
-
-            iou_all = float(iou_per_class.mean())
-            self.log(
-                f"metrics/{log_prefix}_iou_all{block_postfix}",
-                iou_all,
-            )
-
-    def _on_eval_end_semantic(self, log_prefix):
-        if not self.trainer.sanity_checking:
-            cb = self.trainer.callback_metrics
-            val = cb[f"metrics/{log_prefix}_iou_all"] * 100
-            rank_zero_info(f"{bold_green}mIoU: {val:.1f}{reset}")
-
-
     @torch.compiler.disable
-    def plot_semantic(
+    def _plot_predictions(
         self,
         img,
         target,
@@ -287,35 +326,28 @@ class LightningModule(lightning.LightningModule):
         axes[0].imshow(img.cpu().numpy().transpose(1, 2, 0))
         axes[0].axis("off")
 
-        # Make sure we have plain int arrays
-        target_np = target.detach().cpu().numpy().astype(np.int64)       # (H,W) in {0..C-1, 255}
+        target_np = target.detach().cpu().numpy().astype(np.int64)
+        preds_np = torch.argmax(logits, dim=0).detach().cpu().numpy().astype(np.int64)
 
-        # Raw predictions
-        preds_np = torch.argmax(logits, dim=0).detach().cpu().numpy().astype(np.int64)  # (H,W) in {0..C-1}
-
-        # For *visualization only*, force ignored pixels to be black in the prediction:
         ignore_mask = (target_np == self.ignore_idx)
         preds_vis = preds_np.copy()
-        preds_vis[ignore_mask] = self.ignore_idx     # <--- KEY LINE
+        preds_vis[ignore_mask] = self.ignore_idx
 
-        # Build the color set over the union of labels & (masked) preds
         unique_classes = np.unique(
             np.concatenate((np.unique(target_np), np.unique(preds_vis)))
         )
 
         num_classes = len(unique_classes)
-        colors = plt.get_cmap(cmap, num_classes)(np.linspace(0, 1, num_classes))  # RGBA
+        colors = plt.get_cmap(cmap, num_classes)(np.linspace(0, 1, num_classes))
 
-        # Paint the ignore index as black (if present)
         if (self.ignore_idx in unique_classes):
             colors[unique_classes == self.ignore_idx] = [0, 0, 0, 1]
 
         custom_cmap = mcolors.ListedColormap(colors)
         norm = mcolors.Normalize(0, num_classes - 1)
 
-        # Map values to [0..num_classes-1] with the same binning for both images
         target_mapped = np.digitize(target_np, unique_classes) - 1
-        preds_mapped  = np.digitize(preds_vis, unique_classes) - 1
+        preds_mapped = np.digitize(preds_vis, unique_classes) - 1
 
         axes[1].imshow(target_mapped, cmap=custom_cmap, norm=norm, interpolation="nearest")
         axes[1].axis("off")
@@ -323,7 +355,6 @@ class LightningModule(lightning.LightningModule):
         axes[2].imshow(preds_mapped, cmap=custom_cmap, norm=norm, interpolation="nearest")
         axes[2].axis("off")
 
-        # Legend labels: show "ignore" instead of 255
         labels = [("ignore" if cls == self.ignore_idx else str(cls)) for cls in unique_classes]
         patches = [Line2D([0], [0], color=colors[i], lw=4, label=labels[i]) for i in range(num_classes)]
         fig.legend(handles=patches, loc="upper left")
@@ -334,30 +365,27 @@ class LightningModule(lightning.LightningModule):
         plt.close(fig)
         buf.seek(0)
 
-        block_postfix = self.block_postfix(block_idx)
+        block_postfix = self._block_postfix(block_idx)
         name = f"{log_prefix}_pred_{batch_idx}{block_postfix}"
         self.trainer.logger.experiment.log({name: [wandb.Image(Image.open(buf))]})
 
     @torch.compiler.disable
-    def scale_img_size_semantic(self, size: tuple[int, int]):
+    def _scale_img_size(self, size: tuple[int, int]):
         factor = max(
             self.img_size[0] / size[0],
             self.img_size[1] / size[1],
         )
-
         return [round(s * factor) for s in size]
 
     @torch.compiler.disable
-    def window_imgs_semantic(self, imgs):
+    def _window_imgs(self, imgs):
         crops, origins = [], []
 
         for i in range(len(imgs)):
             img = imgs[i]
-            new_h, new_w = self.scale_img_size_semantic(img.shape[-2:])
+            new_h, new_w = self._scale_img_size(img.shape[-2:])
             img_np = img.permute(1, 2, 0).detach().cpu().numpy()
-            # ensure uint8 for PIL
             if img_np.dtype != "uint8":
-                # assume [0,1] float or arbitrary float; clamp + scale
                 img_np = (img_np.clip(0.0, 1.0) * 255.0).astype("uint8")
             pil_img = Image.fromarray(img_np)
             resized_img = pil_img.resize((new_w, new_h), Image.BILINEAR)
@@ -382,10 +410,10 @@ class LightningModule(lightning.LightningModule):
 
         return torch.stack(crops), origins
 
-    def revert_window_logits_semantic(self, crop_logits, origins, img_sizes):
+    def _revert_window_logits(self, crop_logits, origins, img_sizes):
         logit_sums, logit_counts = [], []
         for size in img_sizes:
-            h, w = self.scale_img_size_semantic(size)
+            h, w = self._scale_img_size(size)
             logit_sums.append(
                 torch.zeros((crop_logits.shape[1], h, w), device=crop_logits.device)
             )
@@ -410,8 +438,7 @@ class LightningModule(lightning.LightningModule):
             for i, (sums, counts) in enumerate(zip(logit_sums, logit_counts))
         ]
 
-
-    def to_per_pixel_logits_semantic(self, 
+    def _to_per_pixel_logits(self, 
         mask_logits: torch.Tensor, class_logits: torch.Tensor
     ):
         per_pixel_fg = torch.einsum(
@@ -422,45 +449,36 @@ class LightningModule(lightning.LightningModule):
 
         if self.num_classes == 2:
             p_bg = (1.0 - per_pixel_fg.sum(dim=1, keepdim=True)).clamp(0.0, 1.0)
-            per_pixel = torch.cat([p_bg, per_pixel_fg], dim=1)  # (B,2,H,W)
+            per_pixel = torch.cat([p_bg, per_pixel_fg], dim=1)
         else:
             per_pixel = per_pixel_fg
         return per_pixel
 
-
     @torch.compiler.disable
-    def to_per_pixel_targets_semantic(self,
-        targets: list[dict],
-        ignore_idx,
-    ):
+    def _to_per_pixel_targets(self, targets: list[dict]):
         per_pixel_targets = []
         for target in targets:
             if self.num_classes == 2:
                 per_pixel_target = torch.zeros(
-                target["masks"].shape[-2:],
-                dtype=target["labels"].dtype,
-                device=target["labels"].device, )
+                    target["masks"].shape[-2:],
+                    dtype=target["labels"].dtype,
+                    device=target["labels"].device,
+                )
                 for mask in target["masks"]:
                     per_pixel_target[mask] = 1
             else:
                 per_pixel_target = torch.full(
                     target["masks"].shape[-2:],
-                    ignore_idx,
+                    self.ignore_idx,
                     dtype=target["labels"].dtype,
                     device=target["labels"].device,
                 )
-
                 for i, mask in enumerate(target["masks"]):
                     per_pixel_target[mask] = target["labels"][i]
 
             per_pixel_targets.append(per_pixel_target)
 
         return per_pixel_targets
-
-    def on_save_checkpoint(self, checkpoint):
-        checkpoint["state_dict"] = {
-            k.replace("._orig_mod", ""): v for k, v in checkpoint["state_dict"].items()
-        }
 
     def _zero_init_outside_encoder(self, encoder_prefix="network.encoder."):
         with torch.no_grad():

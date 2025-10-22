@@ -16,7 +16,7 @@ from torch.autograd.function import once_differentiable
 from torch.nn.init import constant_, xavier_uniform_
 
 try:
-    from external.utils.ops import MultiScaleDeformableAttention as MSDA
+    from medsegformers.external.utils.ops import MultiScaleDeformableAttention as MSDA
 except ImportError:
     # if we just care about inference, we don't need
     # the compiled extension for multi-scale deformable attention

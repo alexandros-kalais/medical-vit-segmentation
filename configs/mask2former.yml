@@ -2,11 +2,12 @@
 dataset: endoscopy
 seed: 42
 batch_size: 4
-epochs: 50
+epochs: 1
 num_workers: 0          # keep 0 unless you rework device moves
 subset: 0               # 0 = full dataset
 train_tf_kind: aug
 val_tf_kind: basic
+model_type: mask2former
 
 image_size: [448, 448]
 
@@ -51,3 +52,7 @@ eomt_masked_attn_enabled: false
 # --- logging ---
 wandb_project: Internship-medical-vit-segmentation
 experiment_id: auto
+subset: 20
+
+non_vit_warmup: 1
+vit_warmup: 2

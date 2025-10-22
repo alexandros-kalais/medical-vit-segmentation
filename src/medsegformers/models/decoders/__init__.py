@@ -10,11 +10,7 @@ class DecoderSpec:
 _DECODER_REGISTRY: Dict[str, DecoderSpec] = {}
 
 def register(name: str = None, input_kind: str = "single"):
-    """
-    Usage:
-      @register("linear", input_kind="single")
-      class LinearHead(nn.Module): ...
-    """
+
     def _decorator(cls):
         key = (name or cls.__name__).lower()
         if key in _DECODER_REGISTRY and _DECODER_REGISTRY[key].cls is not cls:
@@ -36,9 +32,6 @@ def build(name: str, **kwargs):
 
 def get_decoder_info(name: str) -> DecoderSpec:
     return _DECODER_REGISTRY[name.lower()]
-
-
-__all__ = ["register", "build", "get_decoder_info"]
 
 from .linear_head import LinearHead
 from .setr_naive_head import NaiveHead

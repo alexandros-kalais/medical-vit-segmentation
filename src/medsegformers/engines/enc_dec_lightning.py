@@ -9,12 +9,11 @@ from torch.optim import AdamW
 from torchvision.utils import make_grid
 from torchmetrics.classification import MulticlassJaccardIndex
 from monai.data import decollate_batch
-
 from monai.transforms import Compose, Activations, AsDiscrete
 
-from medsegformers.utils.vis import colorize_index_map, to_np_uint8
-from medsegformers.losses.dicece import FlexDiceCELoss
-from medsegformers.engines.eomt.two_stage_warmup_poly_schedule import TwoStageWarmupPolySchedule
+from medsegformers.utils import colorize_index_map, to_np_uint8
+from medsegformers.losses import FlexDiceCELoss
+from .two_stage_warmup_poly_schedule import TwoStageWarmupPolySchedule
 
 IGNORE_INDEX = 255
 
@@ -133,28 +132,25 @@ class EncoderDecoderSegModule(L.LightningModule):
         return loss
 
     def on_validation_epoch_end(self):
-        # per-class
-        per_class = self.iou_macro.compute()  # tensor [C]
+        per_class = self.iou_macro.compute()
         for c, v in enumerate(per_class):
             self.log(f"metrics/val_iou_class_{c}", float(v), prog_bar=False, sync_dist=False)
         
-
-        # compute macro mean mIoU manually
         mean_iou = float(per_class.mean())
         self.log("metrics/val_iou_all", mean_iou, prog_bar=True, sync_dist=False)
+        self.log("val_miou", mean_iou, on_epoch=True, prog_bar=False, sync_dist=True)
         self.iou_macro.reset()
 
     def _log_wandb_images(self, images: torch.Tensor, labels: torch.Tensor, logits: torch.Tensor):
 
-            preds_idx = logits.softmax(1).argmax(1)           # (B,H,W) in {0..5}
-            lab_idx   = labels.squeeze(1).long()              # (B,H,W) in {0..5, 255}
+            preds_idx = logits.softmax(1).argmax(1)          
+            lab_idx   = labels.squeeze(1).long()              
 
-            # Mask predictions wherever labels are IGNORE so those pixels render black
             ignore_mask = (lab_idx == IGNORE_INDEX)
             preds_idx_vis = preds_idx.clone()
-            preds_idx_vis[ignore_mask] = IGNORE_INDEX         # <- will render black in colorizer
+            preds_idx_vis[ignore_mask] = IGNORE_INDEX        
 
-            pred_rgb = colorize_index_map(preds_idx_vis, self.num_classes)      # handles 255 -> black
+            pred_rgb = colorize_index_map(preds_idx_vis, self.num_classes)   
             lab_rgb  = colorize_index_map(lab_idx, self.num_classes)
 
             pred_grid_u8 = make_grid(pred_rgb, nrow=2, normalize=False, pad_value=255)
