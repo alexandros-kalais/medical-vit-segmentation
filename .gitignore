@@ -213,28 +213,14 @@ __marimo__/
 
 wandb/
 
-checkpoints/
 
-playground/
-
-
-debug.py
-tests/
 
 scripts/
 
-Internship-medical-vit-segmentation/
+
 
 experiments/
 
 lightning_logs/
 
 logs/
-
-mask2former/
-
-mask2former_lit.py
-
-train_mask2former.py
-
-test_mask2former_wiring.py
