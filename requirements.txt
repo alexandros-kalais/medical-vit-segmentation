@@ -14,3 +14,5 @@ scikit-image
 scipy
 opencv-python
 seaborn
+wandb
+fvcore
