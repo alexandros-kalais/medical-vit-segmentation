@@ -3,8 +3,7 @@ import torch
 
 IGNORE_INDEX = 255
 
-# --- Color maps ---
-COLOR_MAP_NO_BG = torch.tensor([
+COLOR_MAP = torch.tensor([
     [255,   0,   0],  # 0 cystic plate
     [  0, 255,   0],  # 1 Calot triangle
     [  0,   0, 255],  # 2 cystic artery
@@ -13,12 +12,6 @@ COLOR_MAP_NO_BG = torch.tensor([
     [  0, 255, 255],  # 5 tools
 ], dtype=torch.uint8)
 
-BINARY_COLOR_MAP = torch.tensor([
-    [  0,   0,   0],  # 0 background
-    [255,   0,   0],  # 1 foreground
-], dtype=torch.uint8)
-
-# --- Class names (for logging, optional) ---
 ENDOSCOPY_CLASS_NAMES = [
     "cystic plate",     # 0
     "Calot triangle",   # 1
@@ -28,7 +21,6 @@ ENDOSCOPY_CLASS_NAMES = [
     "tools",            # 5
 ]
 
-# --- Colorization ---
 def colorize_index_map(idx_map: torch.Tensor, num_classes: int | None = None) -> torch.Tensor:
 
     if idx_map.ndim == 2:
@@ -37,19 +29,14 @@ def colorize_index_map(idx_map: torch.Tensor, num_classes: int | None = None) ->
 
     device = idx_map.device
 
-    # --- choose the right color map ---
-    if num_classes == 2:
-        cmap = BINARY_COLOR_MAP.to(device)
-    else:
-        cmap = COLOR_MAP_NO_BG.to(device)
-
     B, H, W = idx_map.shape
     colored = torch.zeros(B, H, W, 3, dtype=torch.uint8, device=device)
 
-    valid = (idx_map >= 0) & (idx_map < len(cmap))
-    colored[valid] = cmap[idx_map[valid]]
+    
 
-    # Pixels with IGNORE_INDEX (255) remain black
+    valid = (idx_map >= 0) & (idx_map < len(COLOR_MAP.to(device)))
+    colored[valid] = COLOR_MAP.to(device)[idx_map[valid]]
+
     return colored.permute(0, 3, 1, 2).contiguous()
 
 

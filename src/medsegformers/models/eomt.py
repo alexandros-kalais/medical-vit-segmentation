@@ -1,18 +1,10 @@
-# ---------------------------------------------------------------
-# © 2025 Mobile Perception Systems Lab at TU/e. All rights reserved.
-# Licensed under the MIT License.
-#
-# Portions of this file are adapted from the timm library by Ross Wightman,
-# used under the Apache 2.0 License.
-# ---------------------------------------------------------------
-
 from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-from medsegformers.models.eomt.scale_block import ScaleBlock
+from .scale_block import ScaleBlock
 
 
 class EoMT(nn.Module):

@@ -1,5 +1,6 @@
 experiment_id: auto
 dataset: endoscopy
+model_type: eomt
 
 vit_name: "vit_large_patch16_224"  #facebook/dinov3-vitl16-pretrain-lvd1689m
 image_size: [448, 448]
@@ -10,13 +11,13 @@ llrd: 0.8
 lr_multi: 1.0
 poly_power: 0.9
 weight_decay: 0.05
-epochs: 50
+epochs: 1
 batch_size: 4
 num_workers: 9
 freeze_encoder: False
 unfreeze_last_k: 0
-non_vit_warmup: 0.04
-vit_warmup: 0.08
+non_vit_warmup: 1
+vit_warmup: 2
 
 # eomt specific
 eomt_num_q: 6

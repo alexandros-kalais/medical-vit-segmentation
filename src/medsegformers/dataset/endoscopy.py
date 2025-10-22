@@ -2,19 +2,15 @@ from pathlib import Path
 from typing import Tuple, Union
 import numpy as np
 from PIL import Image
-
 import torch
 from monai.data import Dataset
 from monai.transforms import Compose
-
 from . import register_dataset
-
 
 @register_dataset
 class EndoscopyDataset(Dataset):
     DATASET_NAME = "endoscopy"
     NUM_CLASSES = 6
-   
     REL_ROOT = Path("endoscapes_segmentation_dataset") / "endoscapes_segmentations_processed"
 
     def __init__(
@@ -129,17 +125,3 @@ class EndoscopyDataset(Dataset):
     @classmethod
     def default_root(cls, data_root: Path) -> Path:
         return Path(data_root) / cls.REL_ROOT
-
-    @classmethod
-    def get_image_size(cls, vit_name: str, user_size=None):
-
-        if user_size not in (None, "auto") and len(user_size) == 2:
-            return tuple(user_size)
-
-        name = vit_name.lower()
-        if "dinov2" in name:
-            return (476, 854)
-        elif "dinov3" in name:
-            return (480, 848)
-        else:
-            return (224, 224)

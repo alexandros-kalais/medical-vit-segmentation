@@ -1,11 +1,4 @@
-# ---------------------------------------------------------------
-# © 2025 Mobile Perception Systems Lab at TU/e. All rights reserved.
-# Licensed under the MIT License.
-# ---------------------------------------------------------------
-
-
 from torch.optim.lr_scheduler import LRScheduler
-
 
 class TwoStageWarmupPolySchedule(LRScheduler):
     def __init__(

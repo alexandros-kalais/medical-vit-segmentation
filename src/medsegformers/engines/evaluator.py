@@ -4,7 +4,7 @@ from typing import Dict, Tuple, Optional
 from torchmetrics.classification import MulticlassJaccardIndex
 from monai.data import decollate_batch
 from monai.metrics import HausdorffDistanceMetric
-from medsegformers.utils.vis import ENDOSCOPY_CLASS_NAMES
+from medsegformers.utils import ENDOSCOPY_CLASS_NAMES
 
 import copy, time
 import numpy as np
@@ -19,9 +19,12 @@ def _count_params_total(model: torch.nn.Module) -> int:
 
 def _compute_flops(model: torch.nn.Module, input_shape) -> int:
 
-    model_cpu = copy.deepcopy(model).cpu().eval()
-    x_cpu = torch.randn(*input_shape)  # CPU tensor
-    flops = FlopCountAnalysis(model_cpu, x_cpu).total()
+    dev = next(model.parameters()).device
+    mdl = copy.deepcopy(model).to(dev).eval()
+    x = torch.randn(*input_shape, device=dev)
+
+    with torch.autocast(device_type=dev.type, enabled=False):
+        flops = FlopCountAnalysis(mdl, x).total()
     return int(flops)
 
 def _measure_fps_gpu(
@@ -30,7 +33,7 @@ def _measure_fps_gpu(
     device: torch.device,
     warmup: int = 10,
     runs: int = 50,
-    amp_dtype: torch.dtype | None = torch.bfloat16,  # good default for A100/H100
+    amp_dtype: torch.dtype | None = torch.bfloat16,
 ) -> float:
 
     assert device.type == "cuda", "GPU timing requires CUDA device"
@@ -86,7 +89,7 @@ class Evaluator:
     def efficiency(
         self,
         *,
-        input_shape: tuple,  # (1, 3, H, W)
+        input_shape: tuple,
         warmup: int = 10,
         runs: int = 50,
         amp_dtype: torch.dtype | None = torch.bfloat16,
@@ -115,66 +118,54 @@ class Evaluator:
     def run(self, loader, *, dataset_name: str) -> Dict:
         self.model.eval()
 
-        hd95_class_sums = None  # accumulate per-class sums
+        hd95_class_sums = None
         hd95_class_counts = None
 
         for batch in loader:
             images = batch["image"].to(self.device)
-            labels = batch["label"].to(self.device)          # (B,1,H,W) with {0..C-1, 255}
+            labels = batch["label"].to(self.device)         
 
-            logits = self.model(images)                      # (B,C,H,W)
-            preds  = logits.argmax(dim=1)                    # (B,H,W) in {0..C-1}
-            target = labels.squeeze(1).long()                # (B,H,W) in {0..C-1, 255}
+            logits = self.model(images)                     
+            preds  = logits.argmax(dim=1)                    
+            target = labels.squeeze(1).long()                
 
-
-            # IoU (torchmetrics) — ignores 255 automatically
             self.iou_per_class.update(preds, target)
 
-            # HD95 (optional): build one-hot WITH ignored pixels suppressed
             if self.hd95_metric is not None:
-                # Map ignored labels to class 0 temporarily (to keep shapes), but then zero-out both pred & gt at those positions
+
                 t_tmp = target.clone()
                 t_tmp[target == IGNORE_INDEX] = 0
 
-                # discrete preds for HD: if we confidence-masked to 255, also send them to 0 temp, then zero-out with mask
                 p_tmp = preds.clone()
                 p_tmp[p_tmp == IGNORE_INDEX] = 0
 
-                # one-hot
-                # Shapes: list of (1,C,H,W) expected by monai metrics if using decollate
-                # We’ll build tensors and decollate explicitly.
                 p_oh = torch.nn.functional.one_hot(p_tmp, num_classes=self.num_classes)  \
                         .permute(0,3,1,2).float()
                 t_oh = torch.nn.functional.one_hot(t_tmp, num_classes=self.num_classes)  \
                         .permute(0,3,1,2).float()
 
-                # Zero-out ignored pixels in both p_oh and t_oh
-                ignore = (target == IGNORE_INDEX)            # (B,H,W)
+                ignore = (target == IGNORE_INDEX)            
                 p_oh[ignore.unsqueeze(1).expand_as(p_oh)] = 0.0
                 t_oh[ignore.unsqueeze(1).expand_as(t_oh)] = 0.0
 
-                # decollate to lists for MONAI hd95
                 p_list = list(torch.unbind(p_oh, dim=0))
                 t_list = list(torch.unbind(t_oh, dim=0))
 
-                # compute hd95 per sample (returns tensor [B, C])
-                hd = self.hd95_metric(y_pred=p_list, y=t_list)  # type: ignore
-                # accumulate across batch
-                hd = torch.stack(hd) if isinstance(hd, list) else hd  # (B,C)
+                hd = self.hd95_metric(y_pred=p_list, y=t_list)
+
+                hd = torch.stack(hd) if isinstance(hd, list) else hd 
                 if hd95_class_sums is None:
                     hd95_class_sums = torch.zeros(self.num_classes, device=hd.device)
                     hd95_class_counts = torch.zeros(self.num_classes, device=hd.device)
-                # Only count classes that appear (non-zero gt or pred) to avoid inflating with zeros
-                present = (t_oh.sum(dim=(0,2,3)) > 0)  # which classes present in gt across batch
+
+                present = (t_oh.sum(dim=(0,2,3)) > 0)  
                 hd95_class_sums[present] += hd[:, present].mean(dim=0)
                 hd95_class_counts[present] += 1
 
-        # Final IoU
         miou_per_class = self.iou_per_class.compute().cpu().numpy()
         self.iou_per_class.reset()
-        miou_macro = float(np.nanmean(miou_per_class))   # macro mIoU over 6 classes
+        miou_macro = float(np.nanmean(miou_per_class))   
 
-        # HD95 aggregate
         if self.hd95_metric is not None and hd95_class_sums is not None:
             eps = 1e-9
             hd95_per_class = (hd95_class_sums / (hd95_class_counts + eps)).cpu().numpy()
@@ -183,7 +174,6 @@ class Evaluator:
             hd95_per_class = [float("nan")] * self.num_classes
             mean_hd95 = float("nan")
 
-        # We removed Dice as a tracked metric; if you still want it, compute similarly on masked one-hots.
         result = {
             "miou_per_class": miou_per_class.tolist(),
             "mean_miou": miou_macro,
