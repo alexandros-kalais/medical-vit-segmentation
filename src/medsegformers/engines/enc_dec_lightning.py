@@ -44,10 +44,7 @@ class EncoderDecoderSegModule(L.LightningModule):
         self.poly_power = poly_power
         self.warmup_steps = warmup_steps
         self.llrd_l2_enabled = llrd_l2_enabled
-
-
         self.criterion = FlexDiceCELoss(num_classes=num_classes) 
-
         self.iou_macro = MulticlassJaccardIndex(num_classes=num_classes, ignore_index=IGNORE_INDEX, average=None, validate_args=False
 )
 

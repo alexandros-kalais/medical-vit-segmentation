@@ -26,7 +26,7 @@ class Encoder(nn.Module):
         if hasattr(self.encoder.backbone, "rope_embeddings"):
             rope = self.encoder.backbone.rope_embeddings(x)  # kept for parity; not further used
 
-        # 1) patch embedding → tokens
+        # 1) patch embedding to tokens
         x = self.encoder.backbone.patch_embed(x)
 
         # 2) positional embeddings
@@ -93,7 +93,7 @@ class EncDecModel(nn.Module):
         if len(vit.backbone.blocks) > 12:
             indices = (5, 11, 17, 23)
         else:
-            indices = (1, 4, 7, 11)
+            indices = (2, 5, 8, 11)
 
         self.encoder = Encoder(
             encoder=vit,

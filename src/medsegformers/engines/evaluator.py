@@ -5,7 +5,6 @@ from torchmetrics.classification import MulticlassJaccardIndex
 from monai.data import decollate_batch
 from monai.metrics import HausdorffDistanceMetric
 from medsegformers.utils import ENDOSCOPY_CLASS_NAMES
-
 import copy, time
 import numpy as np
 import torch
@@ -132,19 +131,16 @@ class Evaluator:
             self.iou_per_class.update(preds, target)
 
             if self.hd95_metric is not None:
-
                 t_tmp = target.clone()
                 t_tmp[target == IGNORE_INDEX] = 0
 
                 p_tmp = preds.clone()
                 p_tmp[p_tmp == IGNORE_INDEX] = 0
 
-                p_oh = torch.nn.functional.one_hot(p_tmp, num_classes=self.num_classes)  \
-                        .permute(0,3,1,2).float()
-                t_oh = torch.nn.functional.one_hot(t_tmp, num_classes=self.num_classes)  \
-                        .permute(0,3,1,2).float()
+                p_oh = torch.nn.functional.one_hot(p_tmp, num_classes=self.num_classes).permute(0, 3, 1, 2).float()
+                t_oh = torch.nn.functional.one_hot(t_tmp, num_classes=self.num_classes).permute(0, 3, 1, 2).float()
 
-                ignore = (target == IGNORE_INDEX)            
+                ignore = (target == IGNORE_INDEX)
                 p_oh[ignore.unsqueeze(1).expand_as(p_oh)] = 0.0
                 t_oh[ignore.unsqueeze(1).expand_as(t_oh)] = 0.0
 
@@ -152,27 +148,33 @@ class Evaluator:
                 t_list = list(torch.unbind(t_oh, dim=0))
 
                 hd = self.hd95_metric(y_pred=p_list, y=t_list)
+                hd = torch.stack(hd) if isinstance(hd, list) else hd  # [B, C]
 
-                hd = torch.stack(hd) if isinstance(hd, list) else hd 
+                tgt_present = (t_oh.sum(dim=(2, 3)) > 0)              # [B, C]
+                hd = hd.masked_fill(~tgt_present, float("nan"))        # [B, C]
+
                 if hd95_class_sums is None:
                     hd95_class_sums = torch.zeros(self.num_classes, device=hd.device)
-                    hd95_class_counts = torch.zeros(self.num_classes, device=hd.device)
+                    hd95_class_counts = torch.zeros(self.num_classes, device=hd.device, dtype=torch.long)
 
-                present = (t_oh.sum(dim=(0,2,3)) > 0)  
-                hd95_class_sums[present] += hd[:, present].mean(dim=0)
-                hd95_class_counts[present] += 1
+                hd95_class_sums   += torch.nan_to_num(hd, nan=0.0).sum(dim=0)      # [C]
+                hd95_class_counts += torch.isfinite(hd).sum(dim=0)                  # [C]
+
 
         miou_per_class = self.iou_per_class.compute().cpu().numpy()
         self.iou_per_class.reset()
         miou_macro = float(np.nanmean(miou_per_class))   
 
         if self.hd95_metric is not None and hd95_class_sums is not None:
-            eps = 1e-9
-            hd95_per_class = (hd95_class_sums / (hd95_class_counts + eps)).cpu().numpy()
-            mean_hd95 = float(np.nanmean(hd95_per_class))
+
+            hd95_per_class = hd95_class_sums / hd95_class_counts.clamp_min(1)
+            hd95_per_class[hd95_class_counts == 0] = float("nan")
+            mean_hd95 = float(torch.nanmean(hd95_per_class))
+            hd95_per_class = hd95_per_class.cpu().numpy()
         else:
             hd95_per_class = [float("nan")] * self.num_classes
             mean_hd95 = float("nan")
+
 
         result = {
             "miou_per_class": miou_per_class.tolist(),

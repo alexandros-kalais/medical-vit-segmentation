@@ -5,6 +5,7 @@ from PIL import Image
 import torch
 from monai.data import Dataset
 from monai.transforms import Compose
+from sklearn.model_selection import KFold
 from . import register_dataset
 
 @register_dataset
@@ -16,19 +17,22 @@ class EndoscopyDataset(Dataset):
     def __init__(
         self,
         root: Union[str, Path],
-        split: str,  # ["train", "validation", "test"]
+        split: str,  # ["cross-val", "test"]
         transform: Compose,
         return_masks: bool = False,
-        split_ratio: Tuple[float, float, float] = (0.7, 0.2, 0.1),
+        split_ratio: Tuple[float,float] = (0.9, 0.1),
         seed: int = 42,
+        n_folds: int = 5,
+        fold_idx: int = 0,
+        train: bool = True
     ):
         self.root = Path(root)
         self.split = split
         self.transform = transform
         self.return_masks = return_masks
 
-        if split not in {"train", "validation", "test"}:
-            raise ValueError(f"split must be 'train'|'validation'|'test', got {split!r}")
+        if split not in {"test", "cross-val"}:
+            raise ValueError(f"split must be 'train'|'validation'|'test'|'cross-val', got {split!r}")
 
         img_dir = self.root / "images"
         msk_dir = self.root / "masks"
@@ -51,24 +55,34 @@ class EndoscopyDataset(Dataset):
             raise RuntimeError("No valid image-mask pairs found")
 
         n = len(pairs)
+        
         rng = np.random.RandomState(seed)
         perm = rng.permutation(n)
+        
+        _ , te = split_ratio
+        n_test = int(te * n)
+        
+        trainval_ids = perm[:-n_test] if n_test > 0 else perm
+        test_ids = perm[-n_test:] if n_test > 0 else np.array([])
+        
+        if split == "cross-val":
 
-        tr, va, te = split_ratio
-        n_train = int(tr * n)
-        n_val = int(va * n)
-
-        train_ids = perm[:n_train]
-        val_ids = perm[n_train:n_train + n_val]
-        test_ids = perm[n_train + n_val:]
-
-        if split == "train":
-            idxs = train_ids
-        elif split == "validation":
-            idxs = val_ids
+            n_trainval = len(trainval_ids)
+            kf = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
+            folds = list(kf.split(trainval_ids))
+            fold_train_indices, fold_val_indices = folds[fold_idx]
+            
+            train_ids = trainval_ids[fold_train_indices]
+            val_ids = trainval_ids[fold_val_indices]
+            
+            if train:
+                idxs = train_ids
+            else:
+                idxs = val_ids
         else:
             idxs = test_ids
 
+        idxs = np.sort(idxs)
         self.items = [pairs[i] for i in idxs]
 
     def _is_non_empty(self, mask_path: Path) -> bool:

@@ -217,10 +217,15 @@ wandb/
 
 scripts/
 
-
+src/medsegformers/cli/visualize.py
 
 experiments/
 
 lightning_logs/
 
 logs/
+
+SurgeNet_weights/hf_dinov3_vitb_123749_modified_surgenet.pth
+SurgeNet_weights/hf_dinov3_vits_123749_modified_surgenet.pth
+SurgeNet_weights/hf_dinov3_vitl_123749_modified_surgenet.pth
+

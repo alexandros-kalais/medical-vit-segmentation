@@ -38,7 +38,7 @@ class Mask2FormerModel(nn.Module):
         if len(encoder.backbone.blocks) > 12:
             self._adapter_kwargs["interaction_indexes"] = (5, 11, 17, 23)
         else:
-            self._adapter_kwargs["interaction_indexes"] = (1, 4, 7, 11)
+            self._adapter_kwargs["interaction_indexes"] = (2, 5, 8, 11)
 
         if adapter_kwargs:
             self._adapter_kwargs.update(adapter_kwargs)
@@ -71,21 +71,55 @@ class Mask2FormerModel(nn.Module):
 
         self.adapter = DINOv3_Adapter(**self._adapter_kwargs)
 
-        self.pixel_decoder: Optional[PixelDecoder] = None
-        self.transformer_decoder: Optional[MultiScaleMaskedTransformerDecoder] = None
-        self._built = False
+        # Initialize pixel_decoder and transformer_decoder immediately by running a dummy forward pass through the adapter
+        self._initialize_decoders()
 
         self.masked_attn_enabled = masked_attn_enabled
         self.num_blocks = 1
         self.attn_mask_probs = nn.ParameterList([nn.Parameter(torch.tensor(1.0), requires_grad=False)])
 
+    def _initialize_decoders(self) -> None:
+        """
+        Initialize pixel_decoder and transformer_decoder by running a dummy forward pass.
+        This ensures they exist before optimizer configuration.
+        """
+        # Get patch size and grid size from encoder
+        patch_size = self.encoder.backbone.patch_size
+        if isinstance(patch_size, tuple):
+            patch_size = patch_size[0]
+        
+        # Get grid size from encoder if available
+        if hasattr(self.encoder.backbone, 'patch_embed') and hasattr(self.encoder.backbone.patch_embed, 'grid_size'):
+            grid_h, grid_w = self.encoder.backbone.patch_embed.grid_size
+            dummy_h = grid_h * patch_size
+            dummy_w = grid_w * patch_size
+        else:
+            # Fallback to a reasonable default
+            dummy_h, dummy_w = 448, 448
+        
+        # Get device from encoder parameters
+        device = next(self.encoder.parameters()).device
+        self.adapter = self.adapter.to(device)
+        
+        # Create a dummy input and run through adapter
+        dummy_input = torch.zeros(1, 3, dummy_h, dummy_w, device=device)
+        
+        # Set adapter to eval mode to avoid affecting batch norm stats
+        self.adapter.eval()
+        with torch.no_grad():
+            feats = self.adapter(dummy_input.float())
+        self.adapter.train()
+        
+        # Build decoders using the actual feature shapes
+        self._build_heads_from_feats(feats, device)
+
     @staticmethod
     def _infer_input_shape(feats: Dict[str, torch.Tensor]) -> Dict[str, Tuple[int, int, int, int]]:
         input_shape = {
-        "1": (feats["1"].shape[1], feats["1"].shape[-2], feats["1"].shape[-1], 4),
-        "2": (feats["2"].shape[1], feats["2"].shape[-2], feats["2"].shape[-1], 8),
-        "3": (feats["3"].shape[1], feats["3"].shape[-2], feats["3"].shape[-1], 16),
-        "4": (feats["4"].shape[1], feats["4"].shape[-2], feats["4"].shape[-1], 32),
+            "1": (feats["1"].shape[1], feats["1"].shape[-2], feats["1"].shape[-1], 4),
+            "2": (feats["2"].shape[1], feats["2"].shape[-2], feats["2"].shape[-1], 8),
+            "3": (feats["3"].shape[1], feats["3"].shape[-2], feats["3"].shape[-1], 16),
+            "4": (feats["4"].shape[1], feats["4"].shape[-2], feats["4"].shape[-1], 32),
         }
         return input_shape
 
@@ -93,7 +127,6 @@ class Mask2FormerModel(nn.Module):
         """
         Instantiate PixelDecoder and TransformerDecoder given one adapter pass.
         """
-       
         EMB = feats["1"].shape[1]
 
         input_shape = self._infer_input_shape(feats)
@@ -112,19 +145,14 @@ class Mask2FormerModel(nn.Module):
 
         self.transformer_decoder = MultiScaleMaskedTransformerDecoder(**td_args).to(device)
 
-
-        self._built = True
-
     def forward(self, x: torch.Tensor) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+
+        x = (x - self.encoder.pixel_mean) / self.encoder.pixel_std
 
         amp_enabled = torch.is_autocast_enabled()
 
         with torch.autocast(device_type=x.device.type, enabled=False):
             feats = self.adapter(x.float())
-
-            if not self._built:
-                self._build_heads_from_feats(feats, device=x.device)
-
             mask_features, _memory, multi_scale = self.pixel_decoder.forward_features(feats)
 
         if amp_enabled:
@@ -138,5 +166,3 @@ class Mask2FormerModel(nn.Module):
         pred_masks  = out["pred_masks"]  if isinstance(out, dict) else out[1]
 
         return [pred_masks], [pred_logits]
-
-

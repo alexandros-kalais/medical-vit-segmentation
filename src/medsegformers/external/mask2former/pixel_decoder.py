@@ -339,7 +339,7 @@ class MSDeformAttnPixelDecoder(nn.Module):
         output_convs = []
 
         use_bias = norm == ""
-        for idx, in_channels in enumerate(self.feature_channels[:1]):  # TODO self.num_fpn_levels]):
+        for idx, in_channels in enumerate(self.feature_channels):  # TODO self.num_fpn_levels]):
             lateral_norm = get_norm(norm, conv_dim)
             output_norm = get_norm(norm, conv_dim)
 

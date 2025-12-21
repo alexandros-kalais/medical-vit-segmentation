@@ -1,10 +1,22 @@
+import yaml
+from argparse import Namespace
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from datetime import datetime
 from typing import Tuple, List, Union, Any, Dict, Optional
 from medsegformers.models import EncDecModel, EoMT, Mask2FormerModel
 from medsegformers.engines import EncoderDecoderSegModule, MaskClassificationSemantic
+
+
+def load_config(cfg_path: str) -> Namespace:
+
+    cfg_file = Path(cfg_path)
+    if not cfg_file.exists():
+        raise FileNotFoundError(f"Config file not found: {cfg_file}")
+    with open(cfg_file, "r") as f:
+        data = yaml.safe_load(f)
+    return Namespace(**data)
 
 def encdec_collate(batch):
     return torch.utils.data.dataloader.default_collate(batch)
@@ -82,10 +94,21 @@ def compute_eomt_anneal_schedule(
     return anneal_starts, anneal_ends
 
 def generate_experiment_id(args) -> str:
-    timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-    vit_name_lower = args.vit_name.lower()
     
-    if "dinov3" in vit_name_lower:
+    vit_name_lower = args.vit_name.lower()
+
+    fs_pct = float(getattr(args, "few_shot_pct", 0.0))
+
+    if fs_pct == 0.05:
+        fs_pct_name = "5pct"
+    elif fs_pct == 0.25:
+        fs_pct_name = "25pct"  
+    elif fs_pct == 0:
+        fs_pct_name = "100pct" 
+
+    if args.vit_ckpt != None:
+        vit_short = "SurgeNet"
+    elif "dinov3" in vit_name_lower:
         vit_short = "dinov3"
     elif "dinov2" in vit_name_lower:
         vit_short = "dinov2"
@@ -93,6 +116,21 @@ def generate_experiment_id(args) -> str:
         vit_short = "dino"
     else:
         vit_short = "imagenet"
+
+    if vit_short == "SurgeNet" or vit_short == "dinov3":
+        if "vits16" in vit_name_lower:
+            vit_size = "small"
+        elif "vitb16" in vit_name_lower:
+            vit_size = "base"
+        elif "vitl16" in vit_name_lower:
+            vit_size = "large"
+    else:
+        if "small" in vit_name_lower:
+            vit_size = "small"
+        elif "base" in vit_name_lower:
+            vit_size = "base"
+        elif "large" in vit_name_lower:
+            vit_size = "large"
     
     model_type = args.model_type
     h, w = args.image_size
@@ -106,7 +144,7 @@ def generate_experiment_id(args) -> str:
     else:
         model_prefix = model_type
     
-    exp_id = f"{model_prefix}_{vit_short}_{h}x{w}_lr{args.lr}_bs{args.batch_size}_{timestamp}"
+    exp_id = f"{fs_pct_name}_{model_prefix}_{vit_short}_{vit_size}_{h}x{w}_lr{args.lr}_bs{args.batch_size}_{args.n_folds}folds"
     return exp_id
 
 def build_encdec_model(
@@ -193,13 +231,7 @@ def build_mask2former_model(
         masked_attn_enabled=masked_attn_enabled,
     )
     
-    if mode == "eval":
-        model = MaskClassificationSemanticWrapper(
-            network, img_size=image_size, num_classes=num_classes
-        )
-        model = model.to(device)
-    else:
-        model = network
+    model = network
     
     return model
 
@@ -230,13 +262,8 @@ def build_eomt_model(
         masked_attn_enabled=masked_attn_enabled,
     )
     
-    if mode == "eval":
-        model = MaskClassificationSemanticWrapper(
-            network, img_size=image_size, num_classes=num_classes
-        )
-        model = model.to(device)
-    else:
-        model = network
+
+    model = network
 
     return model
 

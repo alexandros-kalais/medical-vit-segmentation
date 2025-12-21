@@ -4,7 +4,7 @@
 #SBATCH --cpus-per-task=9
 #SBATCH --gpus=1
 #SBATCH --partition=gpu_a100
-#SBATCH --time=02:30:00
+#SBATCH --time=1:00:00
 #SBATCH -o /home/akalais/medseg/repo/medical-vit-segmentation/logs/slurm_logs/%x_%j.out
 
 

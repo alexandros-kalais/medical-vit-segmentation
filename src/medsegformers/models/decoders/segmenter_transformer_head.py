@@ -95,7 +95,7 @@ class MaskTransformerHead(nn.Module):
         in_channels: int = 384,
         n_layers: int = 2,
         n_heads: int = None,
-        d_model: int = 1024,
+        d_model: int = None,
         d_ff: int | None = None,
         drop_path_rate=0.0,
         dropout= 0.1,
@@ -108,20 +108,20 @@ class MaskTransformerHead(nn.Module):
         self.d_model = int(self.in_channels if d_model is None else d_model)
         self.n_heads = int((self.d_model // 64) if n_heads is None else n_heads)
         self.d_ff = 4 * self.d_model
-        self.scale = d_model ** -0.5
+        self.scale = self.d_model ** -0.5
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, n_layers)]
         self.blocks = nn.ModuleList(
-            [Block(d_model, self.n_heads, self.d_ff, dropout, dpr[i]) for i in range(n_layers)]
+            [Block(self.d_model, self.n_heads, self.d_ff, dropout, dpr[i]) for i in range(n_layers)]
         )
 
-        self.cls_emb = nn.Parameter(torch.randn(1, num_classes, d_model))
-        self.proj_dec = nn.Linear(in_channels, d_model)
+        self.cls_emb = nn.Parameter(torch.randn(1, num_classes, self.d_model))
+        self.proj_dec = nn.Linear(in_channels, self.d_model)
 
-        self.proj_patch = nn.Parameter(self.scale * torch.randn(d_model, d_model))
-        self.proj_classes = nn.Parameter(self.scale * torch.randn(d_model, d_model))
+        self.proj_patch = nn.Parameter(self.scale * torch.randn(self.d_model, self.d_model))
+        self.proj_classes = nn.Parameter(self.scale * torch.randn(self.d_model, self.d_model))
 
-        self.decoder_norm = nn.LayerNorm(d_model)
+        self.decoder_norm = nn.LayerNorm(self.d_model)
         self.mask_norm = nn.LayerNorm(num_classes)
 
         self.apply(init_weights)
